@@ -68,24 +68,7 @@ default: bfs
 
 all: bfs tests/mksock
 
-bfs: \
-    bftw.o \
-    color.o \
-    diag.o \
-    dstring.o \
-    eval.o \
-    exec.o \
-    fsade.o \
-    main.o \
-    mtab.o \
-    opt.o \
-    parse.o \
-    printf.o \
-    spawn.o \
-    stat.o \
-    trie.o \
-    typo.o \
-    util.o
+bfs: bfs.o
 	$(CC) $(ALL_LDFLAGS) $^ $(ALL_LDLIBS) -o $@
 
 release: CFLAGS := -g $(WFLAGS) -O3 -flto -DNDEBUG
