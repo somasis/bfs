@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2018 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2018-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -16,9 +16,11 @@
 
 #include "stat.h"
 #include "util.h"
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -32,7 +34,6 @@
 
 #if HAVE_STATX || defined(__NR_statx)
 #	define HAVE_BFS_STATX true
-#	include <sys/sysmacros.h>
 #endif
 
 #if __APPLE__
@@ -42,13 +43,48 @@
 #	define st_birthtim st_birthtimespec
 #endif
 
+const char *bfs_stat_field_name(enum bfs_stat_field field) {
+	switch (field) {
+	case BFS_STAT_DEV:
+		return "device number";
+	case BFS_STAT_INO:
+		return "inode nunmber";
+	case BFS_STAT_TYPE:
+		return "type";
+	case BFS_STAT_MODE:
+		return "mode";
+	case BFS_STAT_NLINK:
+		return "link count";
+	case BFS_STAT_GID:
+		return "group ID";
+	case BFS_STAT_UID:
+		return "user ID";
+	case BFS_STAT_SIZE:
+		return "size";
+	case BFS_STAT_BLOCKS:
+		return "block count";
+	case BFS_STAT_RDEV:
+		return "underlying device";
+	case BFS_STAT_ATIME:
+		return "access time";
+	case BFS_STAT_BTIME:
+		return "birth time";
+	case BFS_STAT_CTIME:
+		return "change time";
+	case BFS_STAT_MTIME:
+		return "modification time";
+	}
+
+	assert(false);
+	return "???";
+}
+
 /**
  * Check if we should retry a failed stat() due to a potentially broken link.
  */
-static bool bfs_stat_retry(int ret, int at_flags, enum bfs_stat_flag flags) {
+static bool bfs_stat_retry(int ret, enum bfs_stat_flag flags) {
 	return ret != 0
-		&& !(at_flags & AT_SYMLINK_NOFOLLOW)
-		&& (flags & BFS_STAT_BROKEN_OK)
+		&& (flags & (BFS_STAT_NOFOLLOW | BFS_STAT_TRYFOLLOW)) == BFS_STAT_TRYFOLLOW
 		&& is_nonexistence_error(errno);
 }
 
@@ -82,6 +118,9 @@ static void bfs_stat_convert(const struct stat *statbuf, struct bfs_stat *buf) {
 	buf->blocks = statbuf->st_blocks;
 	buf->mask |= BFS_STAT_BLOCKS;
 
+	buf->rdev = statbuf->st_rdev;
+	buf->mask |= BFS_STAT_RDEV;
+
 	buf->atime = statbuf->st_atim;
 	buf->mask |= BFS_STAT_ATIME;
 
@@ -104,7 +143,7 @@ static int bfs_stat_impl(int at_fd, const char *at_path, int at_flags, enum bfs_
 	struct stat statbuf;
 	int ret = fstatat(at_fd, at_path, &statbuf, at_flags);
 
-	if (bfs_stat_retry(ret, at_flags, flags)) {
+	if (bfs_stat_retry(ret, flags)) {
 		at_flags |= AT_SYMLINK_NOFOLLOW;
 		ret = fstatat(at_fd, at_path, &statbuf, at_flags);
 	}
@@ -122,6 +161,12 @@ static int bfs_stat_impl(int at_fd, const char *at_path, int at_flags, enum bfs_
  * Wrapper for the statx() system call, which had no glibc wrapper prior to 2.28.
  */
 static int bfs_statx(int at_fd, const char *at_path, int at_flags, unsigned int mask, struct statx *buf) {
+	// -fsanitize=memory doesn't know about statx(), so tell it the memory
+	// got initialized
+#if BFS_HAS_FEATURE(memory_sanitizer, false)
+	memset(buf, 0, sizeof(*buf));
+#endif
+
 #if HAVE_STATX
 	return statx(at_fd, at_path, at_flags, mask, buf);
 #else
@@ -137,7 +182,7 @@ static int bfs_statx_impl(int at_fd, const char *at_path, int at_flags, enum bfs
 	struct statx xbuf;
 	int ret = bfs_statx(at_fd, at_path, at_flags, mask, &xbuf);
 
-	if (bfs_stat_retry(ret, at_flags, flags)) {
+	if (bfs_stat_retry(ret, flags)) {
 		at_flags |= AT_SYMLINK_NOFOLLOW;
 		ret = bfs_statx(at_fd, at_path, at_flags, mask, &xbuf);
 	}
@@ -146,15 +191,16 @@ static int bfs_statx_impl(int at_fd, const char *at_path, int at_flags, enum bfs
 		return ret;
 	}
 
-	if ((xbuf.stx_mask & STATX_BASIC_STATS) != STATX_BASIC_STATS) {
-		// Callers shouldn't have to check anything except BFS_STAT_BTIME
-		errno = EINVAL;
+	// Callers shouldn't have to check anything except the times
+	const unsigned int guaranteed = STATX_BASIC_STATS ^ (STATX_ATIME | STATX_CTIME | STATX_MTIME);
+	if ((xbuf.stx_mask & guaranteed) != guaranteed) {
+		errno = ENOTSUP;
 		return -1;
 	}
 
 	buf->mask = 0;
 
-	buf->dev = makedev(xbuf.stx_dev_major, xbuf.stx_dev_minor);
+	buf->dev = bfs_makedev(xbuf.stx_dev_major, xbuf.stx_dev_minor);
 	buf->mask |= BFS_STAT_DEV;
 
 	if (xbuf.stx_mask & STATX_INO) {
@@ -195,6 +241,9 @@ static int bfs_statx_impl(int at_fd, const char *at_path, int at_flags, enum bfs
 		buf->mask |= BFS_STAT_BLOCKS;
 	}
 
+	buf->rdev = bfs_makedev(xbuf.stx_rdev_major, xbuf.stx_rdev_minor);
+	buf->mask |= BFS_STAT_RDEV;
+
 	if (xbuf.stx_mask & STATX_ATIME) {
 		buf->atime.tv_sec = xbuf.stx_atime.tv_sec;
 		buf->atime.tv_nsec = xbuf.stx_atime.tv_nsec;
@@ -224,13 +273,18 @@ static int bfs_statx_impl(int at_fd, const char *at_path, int at_flags, enum bfs
 
 #endif // HAVE_BFS_STATX
 
-int bfs_stat(int at_fd, const char *at_path, int at_flags, enum bfs_stat_flag flags, struct bfs_stat *buf) {
+/**
+ * Allows calling stat with custom at_flags.
+ */
+static int bfs_stat_explicit(int at_fd, const char *at_path, int at_flags, enum bfs_stat_flag flags, struct bfs_stat *buf) {
 #if HAVE_BFS_STATX
 	static bool has_statx = true;
 
 	if (has_statx) {
 		int ret = bfs_statx_impl(at_fd, at_path, at_flags, flags, buf);
-		if (ret != 0 && errno == ENOSYS) {
+		// EPERM is commonly returned in a seccomp() sandbox that does
+		// not allow statx()
+		if (ret != 0 && (errno == ENOSYS || errno == EPERM)) {
 			has_statx = false;
 		} else {
 			return ret;
@@ -241,12 +295,27 @@ int bfs_stat(int at_fd, const char *at_path, int at_flags, enum bfs_stat_flag fl
 	return bfs_stat_impl(at_fd, at_path, at_flags, flags, buf);
 }
 
-int bfs_fstat(int fd, struct bfs_stat *buf) {
+int bfs_stat(int at_fd, const char *at_path, enum bfs_stat_flag flags, struct bfs_stat *buf) {
+	int at_flags = 0;
+	if (flags & BFS_STAT_NOFOLLOW) {
+		at_flags |= AT_SYMLINK_NOFOLLOW;
+	}
+
+#ifdef AT_STATX_DONT_SYNC
+	if (flags & BFS_STAT_NOSYNC) {
+		at_flags |= AT_STATX_DONT_SYNC;
+	}
+#endif
+
+	if (at_path) {
+		return bfs_stat_explicit(at_fd, at_path, at_flags, flags, buf);
+	}
+
 #ifdef AT_EMPTY_PATH
 	static bool has_at_ep = true;
-
 	if (has_at_ep) {
-		int ret = bfs_stat(fd, "", AT_EMPTY_PATH, 0, buf);
+		at_flags |= AT_EMPTY_PATH;
+		int ret = bfs_stat_explicit(at_fd, "", at_flags, flags, buf);
 		if (ret != 0 && errno == EINVAL) {
 			has_at_ep = false;
 		} else {
@@ -256,9 +325,37 @@ int bfs_fstat(int fd, struct bfs_stat *buf) {
 #endif
 
 	struct stat statbuf;
-	int ret = fstat(fd, &statbuf);
-	if (ret == 0) {
+	if (fstat(at_fd, &statbuf) == 0) {
 		bfs_stat_convert(&statbuf, buf);
+		return 0;
+	} else {
+		return -1;
 	}
-	return ret;
+}
+
+const struct timespec *bfs_stat_time(const struct bfs_stat *buf, enum bfs_stat_field field) {
+	if (!(buf->mask & field)) {
+		errno = ENOTSUP;
+		return NULL;
+	}
+
+	switch (field) {
+	case BFS_STAT_ATIME:
+		return &buf->atime;
+	case BFS_STAT_BTIME:
+		return &buf->btime;
+	case BFS_STAT_CTIME:
+		return &buf->ctime;
+	case BFS_STAT_MTIME:
+		return &buf->mtime;
+	default:
+		assert(false);
+		errno = EINVAL;
+		return NULL;
+	}
+}
+
+void bfs_stat_id(const struct bfs_stat *buf, bfs_file_id *id) {
+	memcpy(*id, &buf->dev, sizeof(buf->dev));
+	memcpy(*id + sizeof(buf->dev), &buf->ino, sizeof(buf->ino));
 }

@@ -14,6 +14,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * Implementation of -exec/-execdir/-ok/-okdir.
+ */
+
 #ifndef BFS_EXEC_H
 #define BFS_EXEC_H
 
@@ -32,8 +36,6 @@ enum bfs_exec_flags {
 	BFS_EXEC_CHDIR   = 1 << 1,
 	/** Pass multiple files at once to the command (-exec ... {} +). */
 	BFS_EXEC_MULTI   = 1 << 2,
-	/** Print debugging information (-D exec). */
-	BFS_EXEC_DEBUG   = 1 << 3,
 };
 
 /**
@@ -43,6 +45,8 @@ struct bfs_exec {
 	/** Flags for this exec buffer. */
 	enum bfs_exec_flags flags;
 
+	/** The overall command line. */
+	const struct cmdline *cmdline;
 	/** Command line template. */
 	char **tmpl_argv;
 	/** Command line template size. */

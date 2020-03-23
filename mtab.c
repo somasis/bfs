@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2017 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2017-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -15,20 +15,22 @@
  ****************************************************************************/
 
 #include "mtab.h"
+#include "darray.h"
+#include "trie.h"
 #include "util.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#ifndef __has_include
-#	define __has_include(header) 0
+#if BFS_HAS_SYS_PARAM
+#	include <sys/param.h>
 #endif
 
-#if __GLIBC__ || __has_include(<mntent.h>)
+#if BFS_HAS_MNTENT
 #	define BFS_MNTENT 1
 #elif BSD
 #	define BFS_MNTINFO 1
@@ -49,191 +51,196 @@
 #endif
 
 /**
- * A mount point in the mount table.
+ * A mount point in the table.
  */
 struct bfs_mtab_entry {
-	/** The device number for this mount point. */
-	dev_t dev;
-	/** The file system type of this mount point. */
+	/** The path to the mount point. */
+	char *path;
+	/** The filesystem type. */
 	char *type;
 };
 
 struct bfs_mtab {
-	/** The array of mtab entries. */
-	struct bfs_mtab_entry *table;
-	/** The size of the array. */
-	size_t size;
-	/** Capacity of the array. */
-	size_t capacity;
+	/** The list of mount points. */
+	struct bfs_mtab_entry *entries;
+	/** The basenames of every mount point. */
+	struct trie names;
+
+	/** A map from device ID to fstype (populated lazily). */
+	struct trie types;
+	/** Whether the types map has been populated. */
+	bool types_filled;
 };
 
 /**
  * Add an entry to the mount table.
  */
-static int bfs_mtab_push(struct bfs_mtab *mtab, dev_t dev, const char *type) {
-	size_t size = mtab->size + 1;
+static int bfs_mtab_add(struct bfs_mtab *mtab, const char *path, const char *type) {
+	struct bfs_mtab_entry entry = {
+		.path = strdup(path),
+		.type = strdup(type),
+	};
 
-	if (size >= mtab->capacity) {
-		size_t capacity = 2*size;
-		struct bfs_mtab_entry *table = realloc(mtab->table, capacity*sizeof(*table));
-		if (!table) {
-			return -1;
-		}
-		mtab->table = table;
-		mtab->capacity = capacity;
+	if (!entry.path || !entry.type) {
+		goto fail_entry;
 	}
 
-	struct bfs_mtab_entry *entry = mtab->table + (size - 1);
-	entry->dev = dev;
-	entry->type = strdup(type);
-	if (!entry->type) {
-		return -1;
+	if (DARRAY_PUSH(&mtab->entries, &entry) != 0) {
+		goto fail_entry;
 	}
 
-	mtab->size = size;
+	if (!trie_insert_str(&mtab->names, xbasename(path))) {
+		goto fail;
+	}
+
 	return 0;
+
+fail_entry:
+	free(entry.type);
+	free(entry.path);
+fail:
+	return -1;
 }
 
 struct bfs_mtab *parse_bfs_mtab() {
+	struct bfs_mtab *mtab = malloc(sizeof(*mtab));
+	if (!mtab) {
+		return NULL;
+	}
+
+	mtab->entries = NULL;
+	trie_init(&mtab->names);
+	trie_init(&mtab->types);
+	mtab->types_filled = false;
+
+	int error = 0;
+
 #if BFS_MNTENT
 
 	FILE *file = setmntent(_PATH_MOUNTED, "r");
 	if (!file) {
 		// In case we're in a chroot or something with /proc but no /etc/mtab
+		error = errno;
 		file = setmntent("/proc/mounts", "r");
 	}
 	if (!file) {
 		goto fail;
 	}
 
-	struct bfs_mtab *mtab = malloc(sizeof(*mtab));
-	if (!mtab) {
-		goto fail_file;
-	}
-	mtab->table = NULL;
-	mtab->size = 0;
-	mtab->capacity = 0;
-
 	struct mntent *mnt;
 	while ((mnt = getmntent(file))) {
-		struct bfs_stat sb;
-		if (bfs_stat(AT_FDCWD, mnt->mnt_dir, 0, 0, &sb) != 0) {
-			continue;
-		}
-
-		if (bfs_mtab_push(mtab, sb.dev, mnt->mnt_type) != 0) {
-			goto fail_mtab;
+		if (bfs_mtab_add(mtab, mnt->mnt_dir, mnt->mnt_type) != 0) {
+			error = errno;
+			endmntent(file);
+			goto fail;
 		}
 	}
 
 	endmntent(file);
-	return mtab;
-
-fail_mtab:
-	free_bfs_mtab(mtab);
-fail_file:
-	endmntent(file);
-fail:
-	return NULL;
 
 #elif BFS_MNTINFO
 
-	struct statfs *mntbuf;
+#if __NetBSD__
+	typedef struct statvfs bfs_statfs;
+#else
+	typedef struct statfs bfs_statfs;
+#endif
+
+	bfs_statfs *mntbuf;
 	int size = getmntinfo(&mntbuf, MNT_WAIT);
 	if (size < 0) {
-		return NULL;
-	}
-
-	struct bfs_mtab *mtab = malloc(sizeof(*mtab));
-	if (!mtab) {
+		error = errno;
 		goto fail;
 	}
 
-	mtab->size = 0;
-	mtab->table = malloc(size*sizeof(*mtab->table));
-	if (!mtab->table) {
-		goto fail_mtab;
-	}
-	mtab->capacity = size;
-
-	for (struct statfs *mnt = mntbuf; mnt < mntbuf + size; ++mnt) {
-		struct bfs_stat sb;
-		if (bfs_stat(AT_FDCWD, mnt->f_mntonname, 0, 0, &sb) != 0) {
-			continue;
-		}
-
-		if (bfs_mtab_push(mtab, sb.dev, mnt->f_fstypename) != 0) {
-			goto fail_mtab;
+	for (bfs_statfs *mnt = mntbuf; mnt < mntbuf + size; ++mnt) {
+		if (bfs_mtab_add(mtab, mnt->f_mntonname, mnt->f_fstypename) != 0) {
+			error = errno;
+			goto fail;
 		}
 	}
-
-	return mtab;
-
-fail_mtab:
-	free_bfs_mtab(mtab);
-fail:
-	return NULL;
 
 #elif BFS_MNTTAB
 
 	FILE *file = fopen(MNTTAB, "r");
 	if (!file) {
+		error = errno;
 		goto fail;
 	}
 
-	struct bfs_mtab *mtab = malloc(sizeof(*mtab));
-	if (!mtab) {
-		goto fail_file;
-	}
-	mtab->table = NULL;
-	mtab->size = 0;
-	mtab->capacity = 0;
-
 	struct mnttab mnt;
 	while (getmntent(file, &mnt) == 0) {
-		struct bfs_stat sb;
-		if (bfs_stat(AT_FDCWD, mnt.mnt_mountp, 0, 0, &sb) != 0) {
-			continue;
-		}
-
-		if (bfs_mtab_push(mtab, sb.dev, mnt.mnt_fstype) != 0) {
-			goto fail_mtab;
+		if (bfs_mtab_add(mtab, mnt.mnt_mountp, mnt.mnt_fstype) != 0) {
+			error = errno;
+			fclose(file);
+			goto fail;
 		}
 	}
 
 	fclose(file);
-	return mtab;
-
-fail_mtab:
-	free_bfs_mtab(mtab);
-fail_file:
-	fclose(file);
-fail:
-	return NULL;
 
 #else
 
-	errno = ENOTSUP;
-	return NULL;
+	error = ENOTSUP;
+	goto fail;
+
 #endif
+
+	return mtab;
+
+fail:
+	free_bfs_mtab(mtab);
+	errno = error;
+	return NULL;
 }
 
-const char *bfs_fstype(const struct bfs_mtab *mtab, const struct bfs_stat *statbuf) {
-	for (struct bfs_mtab_entry *mnt = mtab->table; mnt < mtab->table + mtab->size; ++mnt) {
-		if (statbuf->dev == mnt->dev) {
-			return mnt->type;
+static void bfs_mtab_fill_types(struct bfs_mtab *mtab) {
+	for (size_t i = 0; i < darray_length(mtab->entries); ++i) {
+		struct bfs_mtab_entry *entry = mtab->entries + i;
+
+		struct bfs_stat sb;
+		if (bfs_stat(AT_FDCWD, entry->path, BFS_STAT_NOFOLLOW | BFS_STAT_NOSYNC, &sb) != 0) {
+			continue;
+		}
+
+		struct trie_leaf *leaf = trie_insert_mem(&mtab->types, &sb.dev, sizeof(sb.dev));
+		if (leaf) {
+			leaf->value = entry->type;
 		}
 	}
 
-	return "unknown";
+	mtab->types_filled = true;
+}
+
+const char *bfs_fstype(const struct bfs_mtab *mtab, const struct bfs_stat *statbuf) {
+	if (!mtab->types_filled) {
+		bfs_mtab_fill_types((struct bfs_mtab *)mtab);
+	}
+
+	const struct trie_leaf *leaf = trie_find_mem(&mtab->types, &statbuf->dev, sizeof(statbuf->dev));
+	if (leaf) {
+		return leaf->value;
+	} else {
+		return "unknown";
+	}
+}
+
+bool bfs_might_be_mount(const struct bfs_mtab *mtab, const char *path) {
+	const char *name = xbasename(path);
+	return trie_find_str(&mtab->names, name);
 }
 
 void free_bfs_mtab(struct bfs_mtab *mtab) {
 	if (mtab) {
-		for (struct bfs_mtab_entry *mnt = mtab->table; mnt < mtab->table + mtab->size; ++mnt) {
-			free(mnt->type);
+		trie_destroy(&mtab->types);
+		trie_destroy(&mtab->names);
+
+		for (size_t i = 0; i < darray_length(mtab->entries); ++i) {
+			free(mtab->entries[i].type);
+			free(mtab->entries[i].path);
 		}
-		free(mtab->table);
+		darray_free(mtab->entries);
+
 		free(mtab);
 	}
 }

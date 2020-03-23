@@ -2,6 +2,145 @@
 ===
 
 
+1.6
+---
+
+**February 25, 2020**
+
+- Implemented `-newerXt` (explicit reference times), `-since`, `-asince`, etc.
+- Fixed `-empty` to skip special files (pipes, devices, sockets, etc.)
+
+
+1.5.2
+-----
+
+**January 9, 2020**
+
+- Fixed the build on NetBSD
+- Added support for NFSv4 ACLs on FreeBSD
+- Added a `+` after the file mode for files with ACLs in `-ls`
+- Supported more file types (whiteouts, doors) in symbolic modes for `-ls`/`-printf %M`
+- Implemented `-xattr` on FreeBSD
+
+
+1.5.1
+-----
+
+**September 14, 2019**
+
+- Added a warning to `-mount`, since it will change behaviour in the next POSIX revision
+- Added a workaround for environments that block `statx()` with `seccomp()`, like older Docker
+- Fixed coloring of nonexistent leading directories
+- Avoided calling `stat()` on all mount points at startup
+
+
+1.5
+---
+
+**June 27, 2019**
+
+- New `-xattr` predicate to find files with extended attributes
+- Fixed the `-acl` implementation on macOS
+- Implemented depth-first (`-S dfs`) and iterative deepening search (`-S ids`)
+- Piped `-help` output into `$PAGER` by default
+- Fixed crashes on some invalid `LS_COLORS` values
+
+
+1.4.1
+-----
+
+**April 5, 2019**
+
+- Added a nicer error message when the tests are run as root
+- Fixed detection of comparison expressions with signs, to match GNU find for things like `-uid ++10`
+- Added support for https://no-color.org/
+- Decreased the number of `stat()` calls necessary in some cases
+
+
+1.4
+---
+
+**April 15, 2019**
+
+- New `-unique` option that filters out duplicate files (https://github.com/tavianator/bfs/issues/40)
+- Optimized the file coloring implementation
+- Fixed the coloring implementation to match GNU ls more closely in many corner cases
+  - Implemented escape sequence parsing for `LS_COLORS`
+  - Implemented `ln=target` for coloring links like their targets
+  - Fixed the order of fallbacks used when some color keys are unset
+- Add a workaround for incorrect file types for bind-mounted files on Linux (https://github.com/tavianator/bfs/issues/37)
+
+
+1.3.3
+-----
+
+**February 10, 2019**
+
+- Fixed unpredictable behaviour for empty responses to `-ok`/`-okdir` caused by an uninitialized string
+- Writing to standard output now causes `bfs` to fail if the descriptor was closed
+- Fixed incomplete file coloring in error messages
+- Added some data flow optimizations
+- Fixed `-nogroup`/`-nouser` in big directory trees
+- Added `-type w` for whiteouts, as supported by FreeBSD `find`
+- Re-wrote the `-help` message and manual page
+
+
+1.3.2
+-----
+
+**January 11, 2019**
+
+- Fixed an out-of-bounds read if LS_COLORS doesn't end with a `:`
+- Allowed multiple debug flags to be specified like `-D opt,tree`
+
+
+1.3.1
+-----
+
+**January 3, 2019**
+
+- Fixed some portability problems affecting FreeBSD
+
+
+1.3
+---
+
+**January 2, 2019**
+
+New features:
+
+- `-acl` finds files with non-trivial Access Control Lists (from FreeBSD)
+- `-capable` finds files with capabilities set
+- `-D all` turns on all debugging flags at once
+
+Fixes:
+
+- `LS_COLORS` handling has been improved:
+  - Extension colors are now case-insensitive like GNU `ls`
+  - `or` (orphan) and `mi` (missing) files are now treated differently
+  - Default colors can be unset with `di=00` or similar
+  - Specific colors fall back to more general colors when unspecified in more places
+  - `LS_COLORS` no longer needs a trailing colon
+- `-ls`/`-fls` now prints the major/minor numbers for device nodes
+- `-exec ;` is rejected rather than segfaulting
+- `bfs` now builds on old Linux versions that require `-lrt` for POSIX timers
+- For files whose access/change/modification times can't be read, `bfs` no longer fails unless those times are needed for tests
+- The testsuite is now more correct and portable
+
+
+1.2.4
+-----
+
+**September 24, 2018**
+
+- GNU find compatibility fixes for `-printf`:
+  - `%Y` now prints `?` if an error occurs resolving the link
+  - `%B` is now supported for birth/creation time (as well as `%W`/`%w`)
+  - All standard `strftime()` formats are supported, not just the ones from the GNU find manual
+- Optimizations are now re-run if any expressions are reordered
+- `-exec` and friends no longer leave zombie processes around when `exec()` fails
+
+
 1.2.3
 -----
 

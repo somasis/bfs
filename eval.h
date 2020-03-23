@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2015-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2015-2018 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,6 +14,11 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * The evaluation functions that implement literal expressions like -name,
+ * -print, etc.
+ */
+
 #ifndef BFS_EVAL_H
 #define BFS_EVAL_H
 
@@ -24,7 +29,10 @@ bool eval_true(const struct expr *expr, struct eval_state *state);
 bool eval_false(const struct expr *expr, struct eval_state *state);
 
 bool eval_access(const struct expr *expr, struct eval_state *state);
+bool eval_acl(const struct expr *expr, struct eval_state *state);
+bool eval_capable(const struct expr *expr, struct eval_state *state);
 bool eval_perm(const struct expr *expr, struct eval_state *state);
+bool eval_xattr(const struct expr *expr, struct eval_state *state);
 
 bool eval_newer(const struct expr *expr, struct eval_state *state);
 bool eval_time(const struct expr *expr, struct eval_state *state);

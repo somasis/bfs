@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2017 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2017-2018 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -18,7 +18,9 @@
 #include "bftw.h"
 #include "cmdline.h"
 #include "color.h"
+#include "diag.h"
 #include "dstring.h"
+#include "spawn.h"
 #include "util.h"
 #include <assert.h>
 #include <errno.h>
@@ -33,8 +35,9 @@
 #include <unistd.h>
 
 /** Print some debugging info. */
+BFS_FORMATTER(2, 3)
 static void bfs_exec_debug(const struct bfs_exec *execbuf, const char *format, ...) {
-	if (!(execbuf->flags & BFS_EXEC_DEBUG)) {
+	if (!(execbuf->cmdline->debug & DEBUG_EXEC)) {
 		return;
 	}
 
@@ -113,8 +116,6 @@ static size_t bfs_exec_arg_max(const struct bfs_exec *execbuf) {
 }
 
 struct bfs_exec *parse_bfs_exec(char **argv, enum bfs_exec_flags flags, const struct cmdline *cmdline) {
-	CFILE *cerr = cmdline->cerr;
-
 	struct bfs_exec *execbuf = malloc(sizeof(*execbuf));
 	if (!execbuf) {
 		perror("malloc()");
@@ -122,6 +123,7 @@ struct bfs_exec *parse_bfs_exec(char **argv, enum bfs_exec_flags flags, const st
 	}
 
 	execbuf->flags = flags;
+	execbuf->cmdline = cmdline;
 	execbuf->argv = NULL;
 	execbuf->argc = 0;
 	execbuf->argv_cap = 0;
@@ -132,18 +134,14 @@ struct bfs_exec *parse_bfs_exec(char **argv, enum bfs_exec_flags flags, const st
 	execbuf->wd_len = 0;
 	execbuf->ret = 0;
 
-	if (cmdline->debug & DEBUG_EXEC) {
-		execbuf->flags |= BFS_EXEC_DEBUG;
-	}
-
 	size_t i;
 	for (i = 1; ; ++i) {
 		const char *arg = argv[i];
 		if (!arg) {
 			if (execbuf->flags & BFS_EXEC_CONFIRM) {
-				cfprintf(cerr, "%{er}error: %s: Expected '... ;'.%{rs}\n", argv[0]);
+				bfs_error(cmdline, "%s: Expected '... ;'.\n", argv[0]);
 			} else {
-				cfprintf(cerr, "%{er}error: %s: Expected '... ;' or '... {} +'.%{rs}\n", argv[0]);
+				bfs_error(cmdline, "%s: Expected '... ;' or '... {} +'.\n", argv[0]);
 			}
 			goto fail;
 		} else if (strcmp(arg, ";") == 0) {
@@ -159,6 +157,11 @@ struct bfs_exec *parse_bfs_exec(char **argv, enum bfs_exec_flags flags, const st
 	execbuf->tmpl_argv = argv + 1;
 	execbuf->tmpl_argc = i - 1;
 
+	if (execbuf->tmpl_argc == 0) {
+		bfs_error(cmdline, "%s: Missing command.\n", argv[0]);
+		goto fail;
+	}
+
 	execbuf->argv_cap = execbuf->tmpl_argc + 1;
 	execbuf->argv = malloc(execbuf->argv_cap*sizeof(*execbuf->argv));
 	if (!execbuf->argv) {
@@ -170,7 +173,7 @@ struct bfs_exec *parse_bfs_exec(char **argv, enum bfs_exec_flags flags, const st
 		for (i = 0; i < execbuf->tmpl_argc - 1; ++i) {
 			char *arg = execbuf->tmpl_argv[i];
 			if (strstr(arg, "{}")) {
-				cfprintf(cerr, "%{er}error: %s ... +: Only one '{}' is supported.%{rs}\n", argv[0]);
+				bfs_error(cmdline, "%s ... +: Only one '{}' is supported.\n", argv[0]);
 				goto fail;
 			}
 			execbuf->argv[i] = arg;
@@ -261,6 +264,9 @@ static int bfs_exec_openwd(struct bfs_exec *execbuf, const struct BFTW *ftwbuf) 
 	assert(!execbuf->wd_path);
 
 	if (ftwbuf->at_fd != AT_FDCWD) {
+		// Rely on at_fd being the immediate parent
+		assert(ftwbuf->at_path == xbasename(ftwbuf->at_path));
+
 		execbuf->wd_fd = ftwbuf->at_fd;
 		if (!(execbuf->flags & BFS_EXEC_MULTI)) {
 			return 0;
@@ -339,74 +345,56 @@ static int bfs_exec_spawn(const struct bfs_exec *execbuf) {
 		bfs_exec_debug(execbuf, "Executing '%s' ... [%zu arguments]\n", execbuf->argv[0], execbuf->argc - 1);
 	}
 
-	// Use a pipe to report errors from the child
-	int pipefd[2] = {-1, -1};
-	if (pipe_cloexec(pipefd) != 0) {
-		bfs_exec_debug(execbuf, "pipe() failed: %s\n", strerror(errno));
+	pid_t pid = -1;
+	int error;
+
+	struct bfs_spawn ctx;
+	if (bfs_spawn_init(&ctx) != 0) {
+		return -1;
 	}
 
-	pid_t pid = fork();
+	if (bfs_spawn_setflags(&ctx, BFS_SPAWN_USEPATH) != 0) {
+		goto fail;
+	}
 
+	if (execbuf->wd_fd >= 0) {
+		if (bfs_spawn_addfchdir(&ctx, execbuf->wd_fd) != 0) {
+			goto fail;
+		}
+	}
+
+	pid = bfs_spawn(execbuf->argv[0], &ctx, execbuf->argv, environ);
+fail:
+	error = errno;
+	bfs_spawn_destroy(&ctx);
 	if (pid < 0) {
-		close(pipefd[1]);
-		close(pipefd[0]);
+		errno = error;
 		return -1;
-	} else if (pid > 0) {
-		// Parent
-		close(pipefd[1]);
-
-		int error;
-		ssize_t nbytes = read(pipefd[0], &error, sizeof(error));
-		close(pipefd[0]);
-		if (nbytes == sizeof(error)) {
-			errno = error;
-			return -1;
-		}
-
-		int wstatus;
-		if (waitpid(pid, &wstatus, 0) < 0) {
-			return -1;
-		}
-
-		errno = 0;
-
-		if (WIFEXITED(wstatus)) {
-			int status = WEXITSTATUS(wstatus);
-			if (status == EXIT_SUCCESS) {
-				return 0;
-			} else {
-				bfs_exec_debug(execbuf, "Command '%s' failed with status %d\n", execbuf->argv[0], status);
-			}
-		} else if (WIFSIGNALED(wstatus)) {
-			int sig = WTERMSIG(wstatus);
-			bfs_exec_debug(execbuf, "Command '%s' terminated by signal %d\n", execbuf->argv[0], sig);
-		} else {
-			bfs_exec_debug(execbuf, "Command '%s' terminated abnormally\n", execbuf->argv[0]);
-		}
-
-		return -1;
-	} else {
-		// Child
-		close(pipefd[0]);
-
-		if (execbuf->wd_fd >= 0) {
-			if (fchdir(execbuf->wd_fd) != 0) {
-				goto child_err;
-			}
-		}
-
-		execvp(execbuf->argv[0], execbuf->argv);
-
-		int error;
-	child_err:
-		error = errno;
-		if (write(pipefd[1], &error, sizeof(error)) != sizeof(error)) {
-			// Parent will still see that we exited unsuccessfully, but won't know why
-		}
-		close(pipefd[1]);
-		_Exit(EXIT_FAILURE);
 	}
 
+	int wstatus;
+	if (waitpid(pid, &wstatus, 0) < 0) {
+		return -1;
+	}
+
+	int ret = -1;
+
+	if (WIFEXITED(wstatus)) {
+		int status = WEXITSTATUS(wstatus);
+		if (status == EXIT_SUCCESS) {
+			ret = 0;
+		} else {
+			bfs_exec_debug(execbuf, "Command '%s' failed with status %d\n", execbuf->argv[0], status);
+		}
+	} else if (WIFSIGNALED(wstatus)) {
+		int sig = WTERMSIG(wstatus);
+		bfs_warning(execbuf->cmdline, "Command '${ex}%s${rs}' terminated by signal %d\n", execbuf->argv[0], sig);
+	} else {
+		bfs_warning(execbuf->cmdline, "Command '${ex}%s${rs}' terminated abnormally\n", execbuf->argv[0]);
+	}
+
+	errno = 0;
+	return ret;
 }
 
 /** exec() a command for a single file. */

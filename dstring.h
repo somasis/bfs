@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2016-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2016-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,9 +14,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * A dynamic string library.
+ */
+
 #ifndef BFS_DSTRING_H
 #define BFS_DSTRING_H
 
+#include "util.h"
 #include <stddef.h>
 
 /**
@@ -26,6 +31,24 @@
  *         The initial capacity of the string.
  */
 char *dstralloc(size_t capacity);
+
+/**
+ * Create a dynamic copy of a string.
+ *
+ * @param str
+ *         The NUL-terminated string to copy.
+ */
+char *dstrdup(const char *str);
+
+/**
+ * Create a length-limited dynamic copy of a string.
+ *
+ * @param str
+ *         The string to copy.
+ * @param n
+ *         The maximum number of characters to copy from str.
+ */
+char *dstrndup(const char *str, size_t n);
 
 /**
  * Get a dynamic string's length.
@@ -92,6 +115,19 @@ int dstrncat(char **dest, const char *src, size_t n);
  * @return 0 on success, -1 on failure.
  */
 int dstrapp(char **str, char c);
+
+/**
+ * Create a dynamic string from a format string.
+ *
+ * @param format
+ *         The format string to fill in.
+ * @param ...
+ *         Any arguments for the format string.
+ * @return
+ *         The created string, or NULL on failure.
+ */
+BFS_FORMATTER(1, 2)
+char *dstrprintf(const char *format, ...);
 
 /**
  * Free a dynamic string.

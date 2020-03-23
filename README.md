@@ -2,18 +2,21 @@
 =====
 
 [![License](http://img.shields.io/badge/license-0BSD-blue.svg)](https://github.com/tavianator/bfs/blob/master/COPYING)
-[![LOC](https://tokei.rs/b1/github/tavianator/bfs?category=code)](https://github.com/Aaronepower/tokei)
-[![Build Status](https://api.travis-ci.org/tavianator/bfs.svg?branch=master)](https://travis-ci.org/tavianator/bfs)
+[![Version](https://img.shields.io/github/v/tag/tavianator/bfs?label=version)](https://github.com/tavianator/bfs/releases)
+[![Travis CI Status](https://api.travis-ci.org/tavianator/bfs.svg?branch=master)](https://travis-ci.org/tavianator/bfs)
+[![Cirrus CI Status](https://api.cirrus-ci.com/github/tavianator/bfs.svg)](https://cirrus-ci.com/github/tavianator/bfs)
 
 Breadth-first search for your files.
 
+<img src="https://tavianator.github.io/bfs/animation.svg" alt="Screenshot" />
+
 `bfs` is a variant of the UNIX `find` command that operates [breadth-first](https://en.wikipedia.org/wiki/Breadth-first_search) rather than [depth-first](https://en.wikipedia.org/wiki/Depth-first_search).
-It is otherwise intended to be compatible with many versions of `find`, including
+It is otherwise compatible with many versions of `find`, including
 
 - [POSIX `find`](http://pubs.opengroup.org/onlinepubs/9699919799/utilities/find.html)
 - [GNU `find`](https://www.gnu.org/software/findutils/)
 - {[Free](https://www.freebsd.org/cgi/man.cgi?find(1)),[Open](https://man.openbsd.org/find.1),[Net](http://netbsd.gw.com/cgi-bin/man-cgi?find+1+NetBSD-current)}BSD `find`
-- [macOS `find`](https://developer.apple.com/legacy/library/documentation/Darwin/Reference/ManPages/man1/find.1.html)
+- [macOS `find`](https://ss64.com/osx/find.html)
 
 If you're not familiar with `find`, the [GNU find manual](https://www.gnu.org/software/findutils/manual/html_mono/find.html) provides a good introduction.
 
@@ -96,19 +99,38 @@ Compare `bfs -nohidden` to
     find -name '.?*' -prune -o -print
 
 
-Pretty
-------
-
-When `bfs` detects that its output is a terminal, it automatically colors its output with the same colors `ls` uses.
-This makes it easier to identify relevant files at a glance.
-
-<img src="https://tavianator.github.io/bfs/screenshot.svg" alt="Screenshot" width="100%" />
-
-
 Try it!
 -------
 
-To get `bfs`, download one of the [releases](https://github.com/tavianator/bfs/releases) or clone the [git repo](https://github.com/tavianator/bfs).
+<a href="https://repology.org/metapackage/bfs"><img src="https://repology.org/badge/vertical-allrepos/bfs.svg" alt="Packaging status" align="right" /></a>
+
+`bfs` may already be packaged for your distribution of choice.
+For example:
+
+<pre>
+<strong>Alpine Linux</strong>
+# apk add bfs
+
+<strong>Debian/Ubuntu</strong>
+# apt install bfs
+
+<strong>NixOS</strong>
+# nix-env -i bfs
+
+<strong>Void Linux</strong>
+# xbps-install -S bfs
+
+<strong>FreeBSD</strong>
+# pkg install bfs
+
+<strong>MacPorts</strong>
+# port install bfs
+
+<strong>Homebrew</strong>
+$ brew install tavianator/tap/bfs
+</pre>
+
+To install `bfs` from source, download one of the [releases](https://github.com/tavianator/bfs/releases) or clone the [git repo](https://github.com/tavianator/bfs).
 Then run
 
     $ make
@@ -126,12 +148,3 @@ If you're interested in speed, you may want to build the release version instead
 Finally, if you want to install it globally, run
 
     $ sudo make install
-
-Alternatively, `bfs` may already be packaged for your distribution of choice:
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/bfs.svg)](https://repology.org/metapackage/bfs)
-
-For example:
-
-    # apt install bfs                  # Debian/Ubuntu
-    # brew install tavianator/tap/bfs  # macOS Homebrew

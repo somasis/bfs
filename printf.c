@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2017 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2017-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -17,10 +17,13 @@
 #include "printf.h"
 #include "cmdline.h"
 #include "color.h"
+#include "diag.h"
 #include "dstring.h"
 #include "expr.h"
 #include "mtab.h"
+#include "passwd.h"
 #include "stat.h"
+#include "time.h"
 #include "util.h"
 #include <assert.h>
 #include <errno.h>
@@ -32,12 +35,9 @@
 #include <string.h>
 #include <time.h>
 
-typedef int bfs_printf_fn(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf);
+typedef int bfs_printf_fn(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf);
 
-/**
- * A single directive in a printf command.
- */
-struct bfs_printf_directive {
+struct bfs_printf {
 	/** The printing function to invoke. */
 	bfs_printf_fn *fn;
 	/** String data associated with this directive. */
@@ -46,14 +46,14 @@ struct bfs_printf_directive {
 	enum bfs_stat_field stat_field;
 	/** Character data associated with this directive. */
 	char c;
-	/** The current mount table. */
-	const struct bfs_mtab *mtab;
+	/** Some data used by the directive. */
+	const void *ptr;
 	/** The next printf directive in the chain. */
-	struct bfs_printf_directive *next;
+	struct bfs_printf *next;
 };
 
 /** Print some text as-is. */
-static int bfs_printf_literal(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_literal(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	size_t len = dstrlen(directive->str);
 	if (fwrite(directive->str, 1, len, file) == len) {
 		return 0;
@@ -63,7 +63,7 @@ static int bfs_printf_literal(FILE *file, const struct bfs_printf_directive *dir
 }
 
 /** \c: flush */
-static int bfs_printf_flush(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_flush(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	return fflush(file);
 }
 
@@ -76,37 +76,18 @@ static int bfs_printf_flush(FILE *file, const struct bfs_printf_directive *direc
 	assert(ret >= 0 && ret < sizeof(buf));				\
 	(void)ret
 
-/**
- * Get a particular time field from a struct bfs_stat.
- */
-static const struct timespec *get_time_field(const struct bfs_stat *statbuf, enum bfs_stat_field stat_field) {
-	if (!(statbuf->mask & stat_field)) {
-		errno = ENOTSUP;
-		return NULL;
-	}
-
-	switch (stat_field) {
-	case BFS_STAT_ATIME:
-		return &statbuf->atime;
-	case BFS_STAT_BTIME:
-		return &statbuf->btime;
-	case BFS_STAT_CTIME:
-		return &statbuf->ctime;
-	case BFS_STAT_MTIME:
-		return &statbuf->mtime;
-	default:
-		assert(false);
-		return NULL;
-	}
-}
-
 /** %a, %c, %t: ctime() */
-static int bfs_printf_ctime(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_ctime(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	// Not using ctime() itself because GNU find adds nanoseconds
 	static const char *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 	static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->stat_field);
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	const struct timespec *ts = bfs_stat_time(statbuf, directive->stat_field);
 	if (!ts) {
 		return -1;
 	}
@@ -130,8 +111,13 @@ static int bfs_printf_ctime(FILE *file, const struct bfs_printf_directive *direc
 }
 
 /** %A, %B/%W, %C, %T: strftime() */
-static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	const struct timespec *ts = get_time_field(ftwbuf->statbuf, directive->stat_field);
+static int bfs_printf_strftime(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	const struct timespec *ts = bfs_stat_time(statbuf, directive->stat_field);
 	if (!ts) {
 		return -1;
 	}
@@ -193,43 +179,69 @@ static int bfs_printf_strftime(FILE *file, const struct bfs_printf_directive *di
 }
 
 /** %b: blocks */
-static int bfs_printf_b(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	uintmax_t blocks = ((uintmax_t)ftwbuf->statbuf->blocks*BFS_STAT_BLKSIZE + 511)/512;
+static int bfs_printf_b(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	uintmax_t blocks = ((uintmax_t)statbuf->blocks*BFS_STAT_BLKSIZE + 511)/512;
 	BFS_PRINTF_BUF(buf, "%ju", blocks);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %d: depth */
-static int bfs_printf_d(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_d(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	return fprintf(file, directive->str, (intmax_t)ftwbuf->depth);
 }
 
 /** %D: device */
-static int bfs_printf_D(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->dev);
+static int bfs_printf_D(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->dev);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %f: file name */
-static int bfs_printf_f(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_f(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	return fprintf(file, directive->str, ftwbuf->path + ftwbuf->nameoff);
 }
 
 /** %F: file system type */
-static int bfs_printf_F(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	const char *type = bfs_fstype(directive->mtab, ftwbuf->statbuf);
+static int bfs_printf_F(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	const char *type = bfs_fstype(directive->ptr, statbuf);
 	return fprintf(file, directive->str, type);
 }
 
 /** %G: gid */
-static int bfs_printf_G(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->gid);
+static int bfs_printf_G(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->gid);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %g: group name */
-static int bfs_printf_g(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	struct group *grp = getgrgid(ftwbuf->statbuf->gid);
+static int bfs_printf_g(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	const struct bfs_groups *groups = directive->ptr;
+	const struct group *grp = groups ? bfs_getgrgid(groups, statbuf->gid) : NULL;
 	if (!grp) {
 		return bfs_printf_G(file, directive, ftwbuf);
 	}
@@ -238,7 +250,7 @@ static int bfs_printf_g(FILE *file, const struct bfs_printf_directive *directive
 }
 
 /** %h: leading directories */
-static int bfs_printf_h(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_h(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	char *copy = NULL;
 	const char *buf;
 
@@ -265,25 +277,35 @@ static int bfs_printf_h(FILE *file, const struct bfs_printf_directive *directive
 }
 
 /** %H: current root */
-static int bfs_printf_H(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_H(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	return fprintf(file, directive->str, ftwbuf->root);
 }
 
 /** %i: inode */
-static int bfs_printf_i(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->ino);
+static int bfs_printf_i(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->ino);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %k: 1K blocks */
-static int bfs_printf_k(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	uintmax_t blocks = ((uintmax_t)ftwbuf->statbuf->blocks*BFS_STAT_BLKSIZE + 1023)/1024;
+static int bfs_printf_k(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	uintmax_t blocks = ((uintmax_t)statbuf->blocks*BFS_STAT_BLKSIZE + 1023)/1024;
 	BFS_PRINTF_BUF(buf, "%ju", blocks);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %l: link target */
-static int bfs_printf_l(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_l(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	if (ftwbuf->typeflag != BFTW_LNK) {
 		return 0;
 	}
@@ -299,30 +321,45 @@ static int bfs_printf_l(FILE *file, const struct bfs_printf_directive *directive
 }
 
 /** %m: mode */
-static int bfs_printf_m(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	return fprintf(file, directive->str, (unsigned int)(ftwbuf->statbuf->mode & 07777));
+static int bfs_printf_m(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	return fprintf(file, directive->str, (unsigned int)(statbuf->mode & 07777));
 }
 
 /** %M: symbolic mode */
-static int bfs_printf_M(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_M(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
 	char buf[11];
-	format_mode(ftwbuf->statbuf->mode, buf);
+	format_mode(statbuf->mode, buf);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %n: link count */
-static int bfs_printf_n(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->nlink);
+static int bfs_printf_n(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->nlink);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %p: full path */
-static int bfs_printf_p(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_p(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	return fprintf(file, directive->str, ftwbuf->path);
 }
 
 /** %P: path after root */
-static int bfs_printf_P(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_P(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	const char *path = ftwbuf->path + strlen(ftwbuf->root);
 	if (path[0] == '/') {
 		++path;
@@ -331,32 +368,52 @@ static int bfs_printf_P(FILE *file, const struct bfs_printf_directive *directive
 }
 
 /** %s: size */
-static int bfs_printf_s(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->size);
+static int bfs_printf_s(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->size);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %S: sparseness */
-static int bfs_printf_S(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_S(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
 	double sparsity;
-	const struct bfs_stat *sb = ftwbuf->statbuf;
-	if (sb->size == 0 && sb->blocks == 0) {
+	if (statbuf->size == 0 && statbuf->blocks == 0) {
 		sparsity = 1.0;
 	} else {
-		sparsity = (double)BFS_STAT_BLKSIZE*sb->blocks/sb->size;
+		sparsity = (double)BFS_STAT_BLKSIZE*statbuf->blocks/statbuf->size;
 	}
 	return fprintf(file, directive->str, sparsity);
 }
 
 /** %U: uid */
-static int bfs_printf_U(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)ftwbuf->statbuf->uid);
+static int bfs_printf_U(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	BFS_PRINTF_BUF(buf, "%ju", (uintmax_t)statbuf->uid);
 	return fprintf(file, directive->str, buf);
 }
 
 /** %u: user name */
-static int bfs_printf_u(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
-	struct passwd *pwd = getpwuid(ftwbuf->statbuf->uid);
+static int bfs_printf_u(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, ftwbuf->stat_flags);
+	if (!statbuf) {
+		return -1;
+	}
+
+	const struct bfs_users *users = directive->ptr;
+	const struct passwd *pwd = users ? bfs_getpwuid(users, statbuf->uid) : NULL;
 	if (!pwd) {
 		return bfs_printf_U(file, directive, ftwbuf);
 	}
@@ -388,13 +445,13 @@ static const char *bfs_printf_type(enum bftw_typeflag typeflag) {
 }
 
 /** %y: type */
-static int bfs_printf_y(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_y(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	const char *type = bfs_printf_type(ftwbuf->typeflag);
 	return fprintf(file, directive->str, type);
 }
 
 /** %Y: target type */
-static int bfs_printf_Y(FILE *file, const struct bfs_printf_directive *directive, const struct BFTW *ftwbuf) {
+static int bfs_printf_Y(FILE *file, const struct bfs_printf *directive, const struct BFTW *ftwbuf) {
 	int error = 0;
 
 	if (ftwbuf->typeflag != BFTW_LNK) {
@@ -403,9 +460,9 @@ static int bfs_printf_Y(FILE *file, const struct bfs_printf_directive *directive
 
 	const char *type = "U";
 
-	struct bfs_stat sb;
-	if (bfs_stat(ftwbuf->at_fd, ftwbuf->at_path, 0, 0, &sb) == 0) {
-		type = bfs_printf_type(mode_to_typeflag(sb.mode));
+	const struct bfs_stat *statbuf = bftw_stat(ftwbuf, BFS_STAT_FOLLOW);
+	if (statbuf) {
+		type = bfs_printf_type(bftw_mode_typeflag(statbuf->mode));
 	} else {
 		switch (errno) {
 		case ELOOP:
@@ -433,7 +490,7 @@ static int bfs_printf_Y(FILE *file, const struct bfs_printf_directive *directive
 /**
  * Free a printf directive.
  */
-static void free_directive(struct bfs_printf_directive *directive) {
+static void free_directive(struct bfs_printf *directive) {
 	if (directive) {
 		dstrfree(directive->str);
 		free(directive);
@@ -443,14 +500,14 @@ static void free_directive(struct bfs_printf_directive *directive) {
 /**
  * Create a new printf directive.
  */
-static struct bfs_printf_directive *new_directive() {
-	struct bfs_printf_directive *directive = malloc(sizeof(*directive));
+static struct bfs_printf *new_directive(bfs_printf_fn *fn) {
+	struct bfs_printf *directive = malloc(sizeof(*directive));
 	if (!directive) {
 		perror("malloc()");
 		goto error;
 	}
 
-	directive->fn = NULL;
+	directive->fn = fn;
 	directive->str = dstralloc(2);
 	if (!directive->str) {
 		perror("dstralloc()");
@@ -458,7 +515,7 @@ static struct bfs_printf_directive *new_directive() {
 	}
 	directive->stat_field = 0;
 	directive->c = 0;
-	directive->mtab = NULL;
+	directive->ptr = NULL;
 	directive->next = NULL;
 	return directive;
 
@@ -470,49 +527,30 @@ error:
 /**
  * Append a printf directive to the chain.
  */
-static void append_directive(struct bfs_printf_directive ***tail, struct bfs_printf_directive *directive) {
-	**tail = directive;
-	*tail = &directive->next;
+static struct bfs_printf **append_directive(struct bfs_printf **tail, struct bfs_printf *directive) {
+	assert(directive);
+	*tail = directive;
+	return &directive->next;
 }
 
 /**
  * Append a literal string to the chain.
  */
-static int append_literal(struct bfs_printf_directive ***tail, struct bfs_printf_directive **literal, bool last) {
-	struct bfs_printf_directive *directive = *literal;
-	if (!directive || dstrlen(directive->str) == 0) {
-		return 0;
-	}
-
-	directive->fn = bfs_printf_literal;
-	append_directive(tail, directive);
-
-	if (last) {
+static struct bfs_printf **append_literal(struct bfs_printf **tail, struct bfs_printf **literal) {
+	struct bfs_printf *directive = *literal;
+	if (directive && dstrlen(directive->str) > 0) {
 		*literal = NULL;
+		return append_directive(tail, directive);
 	} else {
-		*literal = new_directive();
-		if (!*literal) {
-			return -1;
-		}
+		return tail;
 	}
-
-	return 0;
 }
 
 struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline) {
-	CFILE *cerr = cmdline->cerr;
+	struct bfs_printf *head = NULL;
+	struct bfs_printf **tail = &head;
 
-	struct bfs_printf *command = malloc(sizeof(*command));
-	if (!command) {
-		perror("malloc()");
-		return NULL;
-	}
-
-	command->directives = NULL;
-	command->needs_stat = false;
-	struct bfs_printf_directive **tail = &command->directives;
-
-	struct bfs_printf_directive *literal = new_directive();
+	struct bfs_printf *literal = new_directive(bfs_printf_literal);
 	if (!literal) {
 		goto error;
 	}
@@ -544,23 +582,20 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 			case '\\': c = '\\'; break;
 
 			case 'c':
-				if (append_literal(&tail, &literal, true) != 0) {
-					goto error;
-				}
-				struct bfs_printf_directive *directive = new_directive();
+				tail = append_literal(tail, &literal);
+				struct bfs_printf *directive = new_directive(bfs_printf_flush);
 				if (!directive) {
 					goto error;
 				}
-				directive->fn = bfs_printf_flush;
-				append_directive(&tail, directive);
+				tail = append_directive(tail, directive);
 				goto done;
 
 			case '\0':
-				cfprintf(cerr, "%{er}error: '%s': Incomplete escape sequence '\\'.%{rs}\n", format);
+				bfs_error(cmdline, "'%s': Incomplete escape sequence '\\'.\n", format);
 				goto error;
 
 			default:
-				cfprintf(cerr, "%{er}error: '%s': Unrecognized escape sequence '\\%c'.%{rs}\n", format, c);
+				bfs_error(cmdline, "'%s': Unrecognized escape sequence '\\%c'.\n", format, c);
 				goto error;
 			}
 		} else if (c == '%') {
@@ -569,7 +604,7 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				goto one_char;
 			}
 
-			struct bfs_printf_directive *directive = new_directive();
+			struct bfs_printf *directive = new_directive(NULL);
 			if (!directive) {
 				goto directive_error;
 			}
@@ -590,10 +625,11 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				case '0':
 				case '+':
 					must_be_numeric = true;
+					// Fallthrough
 				case ' ':
 				case '-':
 					if (strchr(directive->str, c)) {
-						cfprintf(cerr, "%{er}error: '%s': Duplicate flag '%c'.%{rs}\n", format, c);
+						bfs_error(cmdline, "'%s': Duplicate flag '%c'.\n", format, c);
 						goto directive_error;
 					}
 					if (dstrapp(&directive->str, c) != 0) {
@@ -630,16 +666,13 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 			case 'a':
 				directive->fn = bfs_printf_ctime;
 				directive->stat_field = BFS_STAT_ATIME;
-				command->needs_stat = true;
 				break;
 			case 'b':
 				directive->fn = bfs_printf_b;
-				command->needs_stat = true;
 				break;
 			case 'c':
 				directive->fn = bfs_printf_ctime;
 				directive->stat_field = BFS_STAT_CTIME;
-				command->needs_stat = true;
 				break;
 			case 'd':
 				directive->fn = bfs_printf_d;
@@ -647,30 +680,28 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 			case 'D':
 				directive->fn = bfs_printf_D;
-				command->needs_stat = true;
 				break;
 			case 'f':
 				directive->fn = bfs_printf_f;
 				break;
 			case 'F':
 				if (!cmdline->mtab) {
-					cmdline->mtab = parse_bfs_mtab();
-					if (!cmdline->mtab) {
-						cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %m%{rs}\n");
-						goto directive_error;
-					}
+					bfs_error(cmdline, "Couldn't parse the mount table: %s.\n", strerror(cmdline->mtab_error));
+					goto directive_error;
 				}
+				directive->ptr = cmdline->mtab;
 				directive->fn = bfs_printf_F;
-				directive->mtab = cmdline->mtab;
-				command->needs_stat = true;
 				break;
 			case 'g':
+				if (!cmdline->groups) {
+					bfs_error(cmdline, "Couldn't parse the group table: %s.\n", strerror(cmdline->groups_error));
+					goto directive_error;
+				}
+				directive->ptr = cmdline->groups;
 				directive->fn = bfs_printf_g;
-				command->needs_stat = true;
 				break;
 			case 'G':
 				directive->fn = bfs_printf_G;
-				command->needs_stat = true;
 				break;
 			case 'h':
 				directive->fn = bfs_printf_h;
@@ -680,11 +711,9 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 			case 'i':
 				directive->fn = bfs_printf_i;
-				command->needs_stat = true;
 				break;
 			case 'k':
 				directive->fn = bfs_printf_k;
-				command->needs_stat = true;
 				break;
 			case 'l':
 				directive->fn = bfs_printf_l;
@@ -692,15 +721,12 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 			case 'm':
 				directive->fn = bfs_printf_m;
 				specifier = "o";
-				command->needs_stat = true;
 				break;
 			case 'M':
 				directive->fn = bfs_printf_M;
-				command->needs_stat = true;
 				break;
 			case 'n':
 				directive->fn = bfs_printf_n;
-				command->needs_stat = true;
 				break;
 			case 'p':
 				directive->fn = bfs_printf_p;
@@ -710,30 +736,29 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				break;
 			case 's':
 				directive->fn = bfs_printf_s;
-				command->needs_stat = true;
 				break;
 			case 'S':
 				directive->fn = bfs_printf_S;
 				specifier = "g";
-				command->needs_stat = true;
 				break;
 			case 't':
 				directive->fn = bfs_printf_ctime;
 				directive->stat_field = BFS_STAT_MTIME;
-				command->needs_stat = true;
 				break;
 			case 'u':
+				if (!cmdline->users) {
+					bfs_error(cmdline, "Couldn't parse the user table: %s.\n", strerror(cmdline->users_error));
+					goto directive_error;
+				}
+				directive->ptr = cmdline->users;
 				directive->fn = bfs_printf_u;
-				command->needs_stat = true;
 				break;
 			case 'U':
 				directive->fn = bfs_printf_U;
-				command->needs_stat = true;
 				break;
 			case 'w':
 				directive->fn = bfs_printf_ctime;
 				directive->stat_field = BFS_STAT_BTIME;
-				command->needs_stat = true;
 				break;
 			case 'y':
 				directive->fn = bfs_printf_y;
@@ -758,35 +783,29 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 
 			directive_strftime:
 				directive->fn = bfs_printf_strftime;
-				command->needs_stat = true;
 				c = *++i;
 				if (!c) {
-					cfprintf(cerr, "%{er}error: '%s': Incomplete time specifier '%s%c'.%{rs}\n",
-					         format, directive->str, i[-1]);
+					bfs_error(cmdline, "'%s': Incomplete time specifier '%s%c'.\n", format, directive->str, i[-1]);
 					goto directive_error;
 				} else if (strchr("%+@aAbBcCdDeFgGhHIjklmMnprRsStTuUVwWxXyYzZ", c)) {
 					directive->c = c;
 				} else {
-					cfprintf(cerr, "%{er}error: '%s': Unrecognized time specifier '%%%c%c'.%{rs}\n",
-					         format, i[-1], c);
+					bfs_error(cmdline, "'%s': Unrecognized time specifier '%%%c%c'.\n", format, i[-1], c);
 					goto directive_error;
 				}
 				break;
 
 			case '\0':
-				cfprintf(cerr, "%{er}error: '%s': Incomplete format specifier '%s'.%{rs}\n",
-				         format, directive->str);
+				bfs_error(cmdline, "'%s': Incomplete format specifier '%s'.\n", format, directive->str);
 				goto directive_error;
 
 			default:
-				cfprintf(cerr, "%{er}error: '%s': Unrecognized format specifier '%%%c'.%{rs}\n",
-				         format, c);
+				bfs_error(cmdline, "'%s': Unrecognized format specifier '%%%c'.\n", format, c);
 				goto directive_error;
 			}
 
 			if (must_be_numeric && strcmp(specifier, "s") == 0) {
-				cfprintf(cerr, "%{er}error: '%s': Invalid flags '%s' for string format '%%%c'.%{rs}\n",
-				         format, directive->str + 1, c);
+				bfs_error(cmdline, "'%s': Invalid flags '%s' for string format '%%%c'.\n", format, directive->str + 1, c);
 				goto directive_error;
 			}
 
@@ -795,10 +814,16 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 				goto directive_error;
 			}
 
-			if (append_literal(&tail, &literal, false) != 0) {
-				goto directive_error;
+			tail = append_literal(tail, &literal);
+			tail = append_directive(tail, directive);
+
+			if (!literal) {
+				literal = new_directive(bfs_printf_literal);
+				if (!literal) {
+					goto error;
+				}
 			}
-			append_directive(&tail, directive);
+
 			continue;
 
 		directive_error:
@@ -814,23 +839,24 @@ struct bfs_printf *parse_bfs_printf(const char *format, struct cmdline *cmdline)
 	}
 
 done:
-	if (append_literal(&tail, &literal, true) != 0) {
-		goto error;
+	tail = append_literal(tail, &literal);
+	if (head) {
+		free_directive(literal);
+		return head;
+	} else {
+		return literal;
 	}
-
-	free_directive(literal);
-	return command;
 
 error:
 	free_directive(literal);
-	free_bfs_printf(command);
+	free_bfs_printf(head);
 	return NULL;
 }
 
 int bfs_printf(FILE *file, const struct bfs_printf *command, const struct BFTW *ftwbuf) {
 	int ret = 0, error = 0;
 
-	for (struct bfs_printf_directive *directive = command->directives; directive; directive = directive->next) {
+	for (const struct bfs_printf *directive = command; directive; directive = directive->next) {
 		if (directive->fn(file, directive, ftwbuf) < 0) {
 			ret = -1;
 			error = errno;
@@ -842,14 +868,9 @@ int bfs_printf(FILE *file, const struct bfs_printf *command, const struct BFTW *
 }
 
 void free_bfs_printf(struct bfs_printf *command) {
-	if (command) {
-		struct bfs_printf_directive *directive = command->directives;
-		while (directive) {
-			struct bfs_printf_directive *next = directive->next;
-			free_directive(directive);
-			directive = next;
-		}
-
-		free(command);
+	while (command) {
+		struct bfs_printf *next = command->next;
+		free_directive(command);
+		command = next;
 	}
 }

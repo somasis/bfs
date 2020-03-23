@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2016-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2016-2020 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -22,21 +22,39 @@
 #include <langinfo.h>
 #include <regex.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#if BFS_HAS_SYS_PARAM
+#	include <sys/param.h>
+#endif
+
+#if BFS_HAS_SYS_SYSMACROS
+#	include <sys/sysmacros.h>
+#elif BFS_HAS_SYS_MKDEV
+#	include <sys/mkdev.h>
+#endif
+
 int xreaddir(DIR *dir, struct dirent **de) {
-	errno = 0;
-	*de = readdir(dir);
-	if (!*de && errno != 0) {
-		return -1;
-	} else {
-		return 0;
+	while (true) {
+		errno = 0;
+		*de = readdir(dir);
+
+		if (*de) {
+			const char *name = (*de)->d_name;
+			if (name[0] != '.' || (name[1] != '\0' && (name[1] != '.' || name[2] != '\0'))) {
+				return 0;
+			}
+		} else if (errno != 0) {
+			return -1;
+		} else {
+			return 0;
+		}
 	}
 }
 
@@ -75,8 +93,6 @@ bool isopen(int fd) {
 }
 
 int redirect(int fd, const char *path, int flags, ...) {
-	close(fd);
-
 	mode_t mode = 0;
 	if (flags & O_CREAT) {
 		va_list args;
@@ -92,11 +108,9 @@ int redirect(int fd, const char *path, int flags, ...) {
 	int ret = open(path, flags, mode);
 
 	if (ret >= 0 && ret != fd) {
-		int other = ret;
-		ret = dup2(other, fd);
-		if (close(other) != 0) {
-			ret = -1;
-		}
+		int orig = ret;
+		ret = dup2(orig, fd);
+		close(orig);
 	}
 
 	return ret;
@@ -149,21 +163,12 @@ char *xregerror(int err, const regex_t *regex) {
 	return str;
 }
 
-int xlocaltime(const time_t *timep, struct tm *result) {
-	// Should be called before localtime_r() according to POSIX.1-2004
-	tzset();
-
-	if (localtime_r(timep, result)) {
-		return 0;
-	} else {
-		return -1;
-	}
-}
-
 void format_mode(mode_t mode, char str[11]) {
 	strcpy(str, "----------");
 
-	switch (mode_to_typeflag(mode)) {
+	switch (bftw_mode_typeflag(mode)) {
+	case BFTW_REG:
+		break;
 	case BFTW_BLK:
 		str[0] = 'b';
 		break;
@@ -176,16 +181,24 @@ void format_mode(mode_t mode, char str[11]) {
 	case BFTW_DOOR:
 		str[0] = 'D';
 		break;
+	case BFTW_LNK:
+		str[0] = 'l';
+		break;
 	case BFTW_FIFO:
 		str[0] = 'p';
 		break;
-	case BFTW_LNK:
-		str[0] = 'l';
+	case BFTW_PORT:
+		str[0] = 'P';
 		break;
 	case BFTW_SOCK:
 		str[0] = 's';
 		break;
-	default:
+	case BFTW_WHT:
+		str[0] = 'w';
+		break;
+	case BFTW_UNKNOWN:
+	case BFTW_ERROR:
+		str[0] = '?';
 		break;
 	}
 
@@ -265,105 +278,8 @@ bool is_nonexistence_error(int error) {
 	return error == ENOENT || errno == ENOTDIR;
 }
 
-enum bftw_typeflag mode_to_typeflag(mode_t mode) {
-	switch (mode & S_IFMT) {
-#ifdef S_IFBLK
-	case S_IFBLK:
-		return BFTW_BLK;
-#endif
-#ifdef S_IFCHR
-	case S_IFCHR:
-		return BFTW_CHR;
-#endif
-#ifdef S_IFDIR
-	case S_IFDIR:
-		return BFTW_DIR;
-#endif
-#ifdef S_IFDOOR
-	case S_IFDOOR:
-		return BFTW_DOOR;
-#endif
-#ifdef S_IFIFO
-	case S_IFIFO:
-		return BFTW_FIFO;
-#endif
-#ifdef S_IFLNK
-	case S_IFLNK:
-		return BFTW_LNK;
-#endif
-#ifdef S_IFPORT
-	case S_IFPORT:
-		return BFTW_PORT;
-#endif
-#ifdef S_IFREG
-	case S_IFREG:
-		return BFTW_REG;
-#endif
-#ifdef S_IFSOCK
-	case S_IFSOCK:
-		return BFTW_SOCK;
-#endif
-#ifdef S_IFWHT
-	case S_IFWHT:
-		return BFTW_WHT;
-#endif
-
-	default:
-		return BFTW_UNKNOWN;
-	}
-}
-
-enum bftw_typeflag dirent_to_typeflag(const struct dirent *de) {
-#if defined(_DIRENT_HAVE_D_TYPE) || defined(DT_UNKNOWN)
-	switch (de->d_type) {
-#ifdef DT_BLK
-	case DT_BLK:
-		return BFTW_BLK;
-#endif
-#ifdef DT_CHR
-	case DT_CHR:
-		return BFTW_CHR;
-#endif
-#ifdef DT_DIR
-	case DT_DIR:
-		return BFTW_DIR;
-#endif
-#ifdef DT_DOOR
-	case DT_DOOR:
-		return BFTW_DOOR;
-#endif
-#ifdef DT_FIFO
-	case DT_FIFO:
-		return BFTW_FIFO;
-#endif
-#ifdef DT_LNK
-	case DT_LNK:
-		return BFTW_LNK;
-#endif
-#ifdef DT_PORT
-	case DT_PORT:
-		return BFTW_PORT;
-#endif
-#ifdef DT_REG
-	case DT_REG:
-		return BFTW_REG;
-#endif
-#ifdef DT_SOCK
-	case DT_SOCK:
-		return BFTW_SOCK;
-#endif
-#ifdef DT_WHT
-	case DT_WHT:
-		return BFTW_WHT;
-#endif
-	}
-#endif
-
-	return BFTW_UNKNOWN;
-}
-
 /** Read a line from standard input. */
-static char *xgetline() {
+static char *xgetline(void) {
 	char *line = dstralloc(0);
 	if (!line) {
 		return NULL;
@@ -439,4 +355,28 @@ int ynprompt() {
 	int ret = line ? xrpmatch(line) : -1;
 	dstrfree(line);
 	return ret;
+}
+
+dev_t bfs_makedev(int ma, int mi) {
+#ifdef makedev
+	return makedev(ma, mi);
+#else
+	return (ma << 8) | mi;
+#endif
+}
+
+int bfs_major(dev_t dev) {
+#ifdef major
+	return major(dev);
+#else
+	return dev >> 8;
+#endif
+}
+
+int bfs_minor(dev_t dev) {
+#ifdef minor
+	return minor(dev);
+#else
+	return dev & 0xFF;
+#endif
 }

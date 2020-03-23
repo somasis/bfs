@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2015-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2015-2018 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,10 +14,16 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * Utilities for colored output on ANSI terminals.
+ */
+
 #ifndef BFS_COLOR_H
 #define BFS_COLOR_H
 
 #include "bftw.h"
+#include "util.h"
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 
@@ -29,7 +35,7 @@ struct colors;
 /**
  * Parse a color table.
  *
- * @param ls_color
+ * @param ls_colors
  *         A color table in the LS_COLORS environment variable format.
  * @return The parsed color table.
  */
@@ -94,18 +100,25 @@ int cfclose(CFILE *cfile);
  * @param format
  *         A printf()-style format string, supporting these format specifiers:
  *
- *         %%: A literal '%'
  *         %c: A single character
  *         %d: An integer
  *         %g: A double
  *         %s: A string
  *         %zu: A size_t
  *         %m: strerror(errno)
- *         %P: A colored file path, from a const struct BFTW * argument
- *         %L: A colored link target, from a const struct BFTW * argument
- *         %{cc}: Change the color to 'cc'
+ *         %pP: A colored file path, from a const struct BFTW * argument
+ *         %pL: A colored link target, from a const struct BFTW * argument
+ *         %%: A literal '%'
+ *         ${cc}: Change the color to 'cc'
+ *         $$: A literal '$'
  * @return 0 on success, -1 on failure.
  */
+BFS_FORMATTER(2, 3)
 int cfprintf(CFILE *cfile, const char *format, ...);
+
+/**
+ * cfprintf() variant that takes a va_list.
+ */
+int cvfprintf(CFILE *cfile, const char *format, va_list args);
 
 #endif // BFS_COLOR_H

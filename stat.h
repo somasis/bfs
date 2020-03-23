@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2018 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2018-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,13 +14,25 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * A facade over the stat() API that unifies some details that diverge between
+ * implementations, like the names of the timespec fields and the presence of
+ * file "birth" times.  On new enough Linux kernels, the facade is backed by
+ * statx() instead, and so it exposes a similar interface with a mask for which
+ * fields were successfully returned.
+ */
+
 #ifndef BFS_STAT_H
 #define BFS_STAT_H
 
-#include <sys/param.h>
+#include "util.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#if BFS_HAS_SYS_PARAM
+#	include <sys/param.h>
+#endif
 
 /**
  * bfs_stat field bitmask.
@@ -35,18 +47,30 @@ enum bfs_stat_field {
 	BFS_STAT_UID    = 1 << 6,
 	BFS_STAT_SIZE   = 1 << 7,
 	BFS_STAT_BLOCKS = 1 << 8,
-	BFS_STAT_ATIME  = 1 << 9,
-	BFS_STAT_BTIME  = 1 << 10,
-	BFS_STAT_CTIME  = 1 << 11,
-	BFS_STAT_MTIME  = 1 << 12,
+	BFS_STAT_RDEV   = 1 << 9,
+	BFS_STAT_ATIME  = 1 << 10,
+	BFS_STAT_BTIME  = 1 << 11,
+	BFS_STAT_CTIME  = 1 << 12,
+	BFS_STAT_MTIME  = 1 << 13,
 };
+
+/**
+ * Get the human-readable name of a bfs_stat field.
+ */
+const char *bfs_stat_field_name(enum bfs_stat_field field);
 
 /**
  * bfs_stat() flags.
  */
 enum bfs_stat_flag {
-	/** Fall back to the link itself on broken symlinks. */
-	BFS_STAT_BROKEN_OK = 1 << 0,
+	/** Follow symlinks (the default). */
+	BFS_STAT_FOLLOW = 0,
+	/** Never follow symlinks. */
+	BFS_STAT_NOFOLLOW = 1 << 0,
+	/** Try to follow symlinks, but fall back to the link itself if broken. */
+	BFS_STAT_TRYFOLLOW = 1 << 1,
+	/** Try to use cached values without synchronizing remote filesystems. */
+	BFS_STAT_NOSYNC = 1 << 2,
 };
 
 #ifdef DEV_BSIZE
@@ -80,6 +104,8 @@ struct bfs_stat {
 	off_t size;
 	/** Number of disk blocks allocated (of size BFS_STAT_BLKSIZE). */
 	blkcnt_t blocks;
+	/** The device ID represented by this file. */
+	dev_t rdev;
 
 	/** Access time. */
 	struct timespec atime;
@@ -93,12 +119,34 @@ struct bfs_stat {
 
 /**
  * Facade over fstatat().
+ *
+ * @param at_fd
+ *         The base file descriptor for the lookup.
+ * @param at_path
+ *         The path to stat, relative to at_fd.  Pass NULL to fstat() at_fd
+ *         itself.
+ * @param flags
+ *         Flags that affect the lookup.
+ * @param[out] buf
+ *         A place to store the stat buffer, if successful.
+ * @return
+ *         0 on success, -1 on error.
  */
-int bfs_stat(int at_fd, const char *at_path, int at_flags, enum bfs_stat_flag flags, struct bfs_stat *buf);
+int bfs_stat(int at_fd, const char *at_path, enum bfs_stat_flag flags, struct bfs_stat *buf);
 
 /**
- * Facade over fstat().
+ * Get a particular time field from a bfs_stat() buffer.
  */
-int bfs_fstat(int fd, struct bfs_stat *buf);
+const struct timespec *bfs_stat_time(const struct bfs_stat *buf, enum bfs_stat_field field);
+
+/**
+ * A unique ID for a file.
+ */
+typedef unsigned char bfs_file_id[sizeof(dev_t) + sizeof(ino_t)];
+
+/**
+ * Compute a unique ID for a file.
+ */
+void bfs_stat_id(const struct bfs_stat *buf, bfs_file_id *id);
 
 #endif // BFS_STAT_H

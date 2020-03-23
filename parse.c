@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2015-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2015-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,17 +14,31 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * The command line parser.  Expressions are parsed by recursive descent, with a
+ * grammar described in the comments of the parse_*() functions.  The parser
+ * also accepts flags and paths at any point in the expression, by treating
+ * flags like always-true options, and skipping over paths wherever they appear.
+ */
+
 #include "bfs.h"
 #include "cmdline.h"
+#include "darray.h"
+#include "diag.h"
 #include "dstring.h"
 #include "eval.h"
 #include "exec.h"
 #include "expr.h"
+#include "fsade.h"
 #include "mtab.h"
+#include "passwd.h"
 #include "printf.h"
+#include "spawn.h"
 #include "stat.h"
+#include "time.h"
 #include "typo.h"
 #include "util.h"
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,6 +54,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -198,13 +213,13 @@ void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
 	fputs("(", cfile->file);
 
 	if (expr->lhs || expr->rhs) {
-		cfprintf(cfile, "%{red}%s%{rs}", expr->argv[0]);
+		cfprintf(cfile, "${red}%s${rs}", expr->argv[0]);
 	} else {
-		cfprintf(cfile, "%{blu}%s%{rs}", expr->argv[0]);
+		cfprintf(cfile, "${blu}%s${rs}", expr->argv[0]);
 	}
 
 	for (size_t i = 1; i < expr->argc; ++i) {
-		cfprintf(cfile, " %{bld}%s%{rs}", expr->argv[i]);
+		cfprintf(cfile, " ${bld}%s${rs}", expr->argv[i]);
 	}
 
 	if (verbose) {
@@ -213,7 +228,7 @@ void dump_expr(CFILE *cfile, const struct expr *expr, bool verbose) {
 			rate = 100.0*expr->successes/expr->evaluations;
 			time = (1.0e9*expr->elapsed.tv_sec + expr->elapsed.tv_nsec)/expr->evaluations;
 		}
-		cfprintf(cfile, " [%{ylw}%zu%{rs}/%{ylw}%zu%{rs}=%{ylw}%g%%%{rs}; %{ylw}%gns%{rs}]", expr->successes, expr->evaluations, rate, time);
+		cfprintf(cfile, " [${ylw}%zu${rs}/${ylw}%zu${rs}=${ylw}%g%%${rs}; ${ylw}%gns${rs}]", expr->successes, expr->evaluations, rate, time);
 	}
 
 	if (expr->lhs) {
@@ -237,12 +252,6 @@ struct open_file {
 	CFILE *cfile;
 	/** The path to the file (for diagnostics). */
 	const char *path;
-	/** Device number (for deduplication). */
-	dev_t dev;
-	/** Inode number (for deduplication). */
-	ino_t ino;
-	/** The next open file in the chain. */
-	struct open_file *next;
 };
 
 /**
@@ -259,24 +268,28 @@ int free_cmdline(struct cmdline *cmdline) {
 
 		free_bfs_mtab(cmdline->mtab);
 
-		struct open_file *ofile = cmdline->open_files;
-		while (ofile) {
-			struct open_file *next = ofile->next;
+		bfs_free_groups(cmdline->groups);
+		bfs_free_users(cmdline->users);
+
+		struct trie_leaf *leaf;
+		while ((leaf = trie_first_leaf(&cmdline->open_files))) {
+			struct open_file *ofile = leaf->value;
 
 			if (cfclose(ofile->cfile) != 0) {
 				if (cerr) {
-					cfprintf(cerr, "%{er}error: '%s': %m%{rs}\n", ofile->path);
+					bfs_error(cmdline, "'%s': %m.\n", ofile->path);
 				}
 				ret = -1;
 			}
 
 			free(ofile);
-			ofile = next;
+			trie_remove(&cmdline->open_files, leaf);
 		}
+		trie_destroy(&cmdline->open_files);
 
 		if (cout && fflush(cout->file) != 0) {
 			if (cerr) {
-				cfprintf(cerr, "%{er}error: standard output: %m%{rs}\n");
+				bfs_error(cmdline, "standard output: %m.\n");
 			}
 			ret = -1;
 		}
@@ -285,14 +298,7 @@ int free_cmdline(struct cmdline *cmdline) {
 		cfclose(cerr);
 
 		free_colors(cmdline->colors);
-
-		struct root *root = cmdline->roots;
-		while (root) {
-			struct root *next = root->next;
-			free(root);
-			root = next;
-		}
-
+		darray_free(cmdline->paths);
 		free(cmdline->argv);
 		free(cmdline);
 	}
@@ -319,20 +325,18 @@ struct parser_state {
 	char **argv;
 	/** The name of this program. */
 	const char *command;
-	/** The current tail of the root path list. */
-	struct root **roots_tail;
 
 	/** The current regex flags to use. */
 	int regex_flags;
 
-	/** Whether this session is interactive. */
+	/** Whether stdout is a terminal. */
+	bool stdout_tty;
+	/** Whether this session is interactive (stdin and stderr are each a terminal). */
 	bool interactive;
 	/** Whether -color or -nocolor has been passed. */
 	enum use_color use_color;
 	/** Whether a -print action is implied. */
 	bool implicit_print;
-	/** Whether warnings are enabled (see -warn, -nowarn). */
-	bool warn;
 	/** Whether the expression has started. */
 	bool expr_started;
 	/** Whether any non-option arguments have been encountered. */
@@ -340,10 +344,16 @@ struct parser_state {
 	/** Whether an information option like -help or -version was passed. */
 	bool just_info;
 
+	/** The last non-path argument. */
+	const char *last_arg;
 	/** A "-depth"-type argument if any. */
 	const char *depth_arg;
 	/** A "-prune"-type argument if any. */
 	const char *prune_arg;
+	/** A "-mount"-type argument if any. */
+	const char *mount_arg;
+	/** An "-xdev"-type argument if any. */
+	const char *xdev_arg;
 
 	/** The current time. */
 	struct timespec now;
@@ -368,6 +378,28 @@ enum token_type {
 };
 
 /**
+ * Print an error message during parsing.
+ */
+BFS_FORMATTER(2, 3)
+static void parse_error(const struct parser_state *state, const char *format, ...) {
+	va_list args;
+	va_start(args, format);
+	bfs_verror(state->cmdline, format, args);
+	va_end(args);
+}
+
+/**
+ * Print a warning message during parsing.
+ */
+BFS_FORMATTER(2, 3)
+static void parse_warning(const struct parser_state *state, const char *format, ...) {
+	va_list args;
+	va_start(args, format);
+	bfs_vwarning(state->cmdline, format, args);
+	va_end(args);
+}
+
+/**
  * Fill in a "-print"-type expression.
  */
 static void init_print_expr(struct parser_state *state, struct expr *expr) {
@@ -386,36 +418,42 @@ static int expr_open(struct parser_state *state, struct expr *expr, const char *
 
 	CFILE *cfile = cfopen(path, state->use_color ? cmdline->colors : NULL);
 	if (!cfile) {
-		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", path);
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: %m.\n", expr->argv[0], path);
 		goto out;
 	}
 
 	struct bfs_stat sb;
-	if (bfs_fstat(fileno(cfile->file), &sb) != 0) {
-		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", path);
+	if (bfs_stat(fileno(cfile->file), NULL, 0, &sb) != 0) {
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: %m.\n", expr->argv[0], path);
 		goto out_close;
 	}
 
-	for (struct open_file *ofile = cmdline->open_files; ofile; ofile = ofile->next) {
-		if (ofile->dev == sb.dev && ofile->ino == sb.ino) {
-			expr->cfile = ofile->cfile;
-			ret = 0;
-			goto out_close;
-		}
+	bfs_file_id id;
+	bfs_stat_id(&sb, &id);
+
+	struct trie_leaf *leaf = trie_insert_mem(&cmdline->open_files, id, sizeof(id));
+	if (!leaf) {
+		perror("trie_insert_mem()");
+		goto out_close;
+	}
+
+	if (leaf->value) {
+		struct open_file *ofile = leaf->value;
+		expr->cfile = ofile->cfile;
+		ret = 0;
+		goto out_close;
 	}
 
 	struct open_file *ofile = malloc(sizeof(*ofile));
 	if (!ofile) {
 		perror("malloc()");
+		trie_remove(&cmdline->open_files, leaf);
 		goto out_close;
 	}
 
 	ofile->cfile = cfile;
 	ofile->path = path;
-	ofile->dev = sb.dev;
-	ofile->ino = sb.ino;
-	ofile->next = cmdline->open_files;
-	cmdline->open_files = ofile;
+	leaf->value = ofile;
 	++cmdline->nopen_files;
 
 	expr->cfile = cfile;
@@ -436,11 +474,11 @@ static int stat_arg(const struct parser_state *state, struct expr *expr, struct 
 	const struct cmdline *cmdline = state->cmdline;
 
 	bool follow = cmdline->flags & (BFTW_COMFOLLOW | BFTW_LOGICAL);
-	int at_flags = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+	enum bfs_stat_flag flags = follow ? BFS_STAT_TRYFOLLOW : BFS_STAT_NOFOLLOW;
 
-	int ret = bfs_stat(AT_FDCWD, expr->sdata, at_flags, BFS_STAT_BROKEN_OK, sb);
+	int ret = bfs_stat(AT_FDCWD, expr->sdata, flags, sb);
 	if (ret != 0) {
-		cfprintf(cmdline->cerr, "%{er}error: '%s': %m%{rs}\n", expr->sdata);
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: %m.\n", expr->argv[0], expr->sdata);
 	}
 	return ret;
 }
@@ -462,6 +500,10 @@ static char **parser_advance(struct parser_state *state, enum token_type type, s
 		}
 	}
 
+	if (type != T_PATH) {
+		state->last_arg = *state->argv;
+	}
+
 	char **argv = state->argv;
 	state->argv += argc;
 	return argv;
@@ -471,17 +513,8 @@ static char **parser_advance(struct parser_state *state, enum token_type type, s
  * Parse a root path.
  */
 static int parse_root(struct parser_state *state, const char *path) {
-	struct root *root = malloc(sizeof(struct root));
-	if (!root) {
-		perror("malloc()");
-		return -1;
-	}
-
-	root->path = path;
-	root->next = NULL;
-	*state->roots_tail = root;
-	state->roots_tail = &root->next;
-	return 0;
+	struct cmdline *cmdline = state->cmdline;
+	return DARRAY_PUSH(&cmdline->paths, &path);
 }
 
 /**
@@ -589,13 +622,17 @@ static const char *parse_int(const struct parser_state *state, const char *str, 
 	case IF_LONG_LONG:
 		*(long long *)result = value;
 		break;
+
+	default:
+		assert(false);
+		goto bad;
 	}
 
 	return endptr;
 
 bad:
 	if (!(flags & IF_QUIET)) {
-		cfprintf(state->cmdline->cerr, "%{er}error: '%s' is not a valid integer.%{rs}\n", str);
+		parse_error(state, "${bld}%s${rs} is not a valid integer.\n", str);
 	}
 	return NULL;
 }
@@ -625,10 +662,16 @@ static const char *parse_icmp(const struct parser_state *state, const char *str,
  * Check if a string could be an integer comparison.
  */
 static bool looks_like_icmp(const char *str) {
-	if (str[0] == '-' || str[0] == '+') {
-		++str;
+	int i;
+
+	// One +/- for the comparison flag, one for the sign
+	for (i = 0; i < 2; ++i) {
+		if (str[i] != '-' && str[i] != '+') {
+			break;
+		}
 	}
-	return str[0] >= '0' && str[0] <= '9';
+
+	return str[i] >= '0' && str[i] <= '9';
 }
 
 /**
@@ -659,13 +702,12 @@ static struct expr *parse_unary_flag(struct parser_state *state) {
 static struct expr *parse_option(struct parser_state *state, size_t argc) {
 	const char *arg = *parser_advance(state, T_OPTION, argc);
 
-	if (state->warn && state->non_option_seen) {
-		cfprintf(state->cmdline->cerr,
-		         "%{wr}warning: The '%s' option applies to the entire command line.  For clarity, place\n"
-		         "it before any non-option arguments.%{rs}\n\n",
-		         arg);
+	if (state->non_option_seen) {
+		parse_warning(state,
+		              "The ${blu}%s${rs} option applies to the entire command line.  For clarity, place\n"
+		              "it before any non-option arguments.\n\n",
+		              arg);
 	}
-
 
 	return &expr_true;
 }
@@ -702,14 +744,7 @@ static struct expr *parse_nullary_positional_option(struct parser_state *state) 
 /**
  * Parse a positional option that takes a single value.
  */
-static struct expr *parse_unary_positional_option(struct parser_state *state, const char **value) {
-	const char *arg = state->argv[0];
-	*value = state->argv[1];
-	if (!*value) {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s needs a value.%{rs}\n", arg);
-		return NULL;
-	}
-
+static struct expr *parse_unary_positional_option(struct parser_state *state) {
 	return parse_positional_option(state, 2);
 }
 
@@ -739,7 +774,7 @@ static struct expr *parse_unary_test(struct parser_state *state, eval_fn *eval) 
 	const char *arg = state->argv[0];
 	const char *value = state->argv[1];
 	if (!value) {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s needs a value.%{rs}\n", arg);
+		parse_error(state, "${blu}%s${rs} needs a value.\n", arg);
 		return NULL;
 	}
 
@@ -776,7 +811,7 @@ static struct expr *parse_unary_action(struct parser_state *state, eval_fn *eval
 	const char *arg = state->argv[0];
 	const char *value = state->argv[1];
 	if (!value) {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s needs a value.%{rs}\n", arg);
+		parse_error(state, "${blu}%s${rs} needs a value.\n", arg);
 		return NULL;
 	}
 
@@ -805,48 +840,102 @@ static struct expr *parse_test_icmp(struct parser_state *state, eval_fn *eval) {
 }
 
 /**
+ * Print usage information for -D.
+ */
+static void debug_help(CFILE *cfile) {
+	cfprintf(cfile, "Supported debug flags:\n\n");
+
+	cfprintf(cfile, "  ${bld}help${rs}:   This message.\n");
+	cfprintf(cfile, "  ${bld}cost${rs}:   Show cost estimates.\n");
+	cfprintf(cfile, "  ${bld}exec${rs}:   Print executed command details.\n");
+	cfprintf(cfile, "  ${bld}opt${rs}:    Print optimization details.\n");
+	cfprintf(cfile, "  ${bld}rates${rs}:  Print predicate success rates.\n");
+	cfprintf(cfile, "  ${bld}search${rs}: Trace the filesystem traversal.\n");
+	cfprintf(cfile, "  ${bld}stat${rs}:   Trace all stat() calls.\n");
+	cfprintf(cfile, "  ${bld}tree${rs}:   Print the parse tree.\n");
+	cfprintf(cfile, "  ${bld}all${rs}:    All debug flags at once.\n");
+}
+
+/** A named debug flag. */
+struct debug_flag {
+	enum debug_flags flag;
+	const char *name;
+};
+
+/** The table of debug flags. */
+struct debug_flag debug_flags[] = {
+	{DEBUG_ALL,    "all"},
+	{DEBUG_COST,   "cost"},
+	{DEBUG_EXEC,   "exec"},
+	{DEBUG_OPT,    "opt"},
+	{DEBUG_RATES,  "rates"},
+	{DEBUG_SEARCH, "search"},
+	{DEBUG_STAT,   "stat"},
+	{DEBUG_TREE,   "tree"},
+	{0},
+};
+
+/** Check if a substring matches a debug flag. */
+static bool parse_debug_flag(const char *flag, size_t len, const char *expected) {
+	if (len == strlen(expected)) {
+		return strncmp(flag, expected, len) == 0;
+	} else {
+		return false;
+	}
+}
+
+/**
  * Parse -D FLAG.
  */
 static struct expr *parse_debug(struct parser_state *state, int arg1, int arg2) {
 	struct cmdline *cmdline = state->cmdline;
 
 	const char *arg = state->argv[0];
-	const char *flag = state->argv[1];
-	if (!flag) {
-		cfprintf(cmdline->cerr, "%{er}error: %s needs a flag.%{rs}\n", arg);
+	const char *flags = state->argv[1];
+	if (!flags) {
+		parse_error(state, "${cyn}%s${rs} needs a flag.\n\n", arg);
+		debug_help(cmdline->cerr);
 		return NULL;
 	}
 
-	if (strcmp(flag, "help") == 0) {
-		printf("Supported debug flags:\n\n");
+	bool unrecognized = false;
 
-		printf("  help:   This message.\n");
-		printf("  cost:   Show cost estimates.\n");
-		printf("  exec:   Print executed command details.\n");
-		printf("  opt:    Print optimization details.\n");
-		printf("  rates:  Print predicate success rates.\n");
-		printf("  search: Trace the filesystem traversal.\n");
-		printf("  stat:   Trace all stat() calls.\n");
-		printf("  tree:   Print the parse tree.\n");
+	for (const char *flag = flags, *next; flag; flag = next) {
+		size_t len = strcspn(flag, ",");
+		if (flag[len]) {
+			next = flag + len + 1;
+		} else {
+			next = NULL;
+		}
 
-		state->just_info = true;
-		return NULL;
-	} else if (strcmp(flag, "cost") == 0) {
-		cmdline->debug |= DEBUG_COST;
-	} else if (strcmp(flag, "exec") == 0) {
-		cmdline->debug |= DEBUG_EXEC;
-	} else if (strcmp(flag, "opt") == 0) {
-		cmdline->debug |= DEBUG_OPT;
-	} else if (strcmp(flag, "rates") == 0) {
-		cmdline->debug |= DEBUG_RATES;
-	} else if (strcmp(flag, "search") == 0) {
-		cmdline->debug |= DEBUG_SEARCH;
-	} else if (strcmp(flag, "stat") == 0) {
-		cmdline->debug |= DEBUG_STAT;
-	} else if (strcmp(flag, "tree") == 0) {
-		cmdline->debug |= DEBUG_TREE;
-	} else {
-		cfprintf(cmdline->cerr, "%{wr}warning: Unrecognized debug flag '%s'.%{rs}\n\n", flag);
+		if (parse_debug_flag(flag, len, "help")) {
+			debug_help(cmdline->cout);
+			state->just_info = true;
+			return NULL;
+		}
+
+		for (int i = 0; ; ++i) {
+			const char *expected = debug_flags[i].name;
+			if (!expected) {
+				if (cmdline->warn) {
+					parse_warning(state, "Unrecognized debug flag ${bld}");
+					fwrite(flag, 1, len, stderr);
+					cfprintf(cmdline->cerr, "${rs}.\n\n");
+					unrecognized = true;
+				}
+				break;
+			}
+
+			if (parse_debug_flag(flag, len, expected)) {
+				cmdline->debug |= debug_flags[i].flag;
+				break;
+			}
+		}
+	}
+
+	if (unrecognized) {
+		debug_help(cmdline->cerr);
+		cfprintf(cmdline->cerr, "\n");
 	}
 
 	return parse_unary_flag(state);
@@ -864,8 +953,8 @@ static struct expr *parse_optlevel(struct parser_state *state, int arg1, int arg
 		return NULL;
 	}
 
-	if (state->warn && *optlevel > 4) {
-		cfprintf(state->cmdline->cerr, "%{wr}warning: %s is the same as -O4.%{rs}\n\n", state->argv[0]);
+	if (*optlevel > 4) {
+		parse_warning(state, "${cyn}-O${bld}%s${rs} is the same as ${cyn}-O${bld}4${rs}.\n\n", state->argv[0] + 2);
 	}
 
 	return parse_nullary_flag(state);
@@ -876,7 +965,7 @@ static struct expr *parse_optlevel(struct parser_state *state, int arg1, int arg
  */
 static struct expr *parse_follow(struct parser_state *state, int flags, int option) {
 	struct cmdline *cmdline = state->cmdline;
-	cmdline->flags &= ~(BFTW_COMFOLLOW | BFTW_LOGICAL | BFTW_DETECT_CYCLES);
+	cmdline->flags &= ~(BFTW_COMFOLLOW | BFTW_LOGICAL);
 	cmdline->flags |= flags;
 	if (option) {
 		return parse_nullary_positional_option(state);
@@ -898,10 +987,43 @@ static struct expr *parse_xargs_safe(struct parser_state *state, int arg1, int a
  */
 static struct expr *parse_access(struct parser_state *state, int flag, int arg2) {
 	struct expr *expr = parse_nullary_test(state, eval_access);
+	if (!expr) {
+		return NULL;
+	}
+
+	expr->idata = flag;
+	expr->cost = STAT_COST;
+
+	switch (flag) {
+	case R_OK:
+		expr->probability = 0.99;
+		break;
+	case W_OK:
+		expr->probability = 0.8;
+		break;
+	case X_OK:
+		expr->probability = 0.2;
+		break;
+	}
+
+	return expr;
+}
+
+/**
+ * Parse -acl.
+ */
+static struct expr *parse_acl(struct parser_state *state, int flag, int arg2) {
+#if BFS_CAN_CHECK_ACL
+	struct expr *expr = parse_nullary_test(state, eval_acl);
 	if (expr) {
-		expr->idata = flag;
+		expr->cost = STAT_COST;
+		expr->probability = 0.00002;
 	}
 	return expr;
+#else
+	parse_error(state, "${blu}%s${rs} is missing platform support.\n", state->argv[0]);
+	return NULL;
+#endif
 }
 
 /**
@@ -942,6 +1064,23 @@ static struct expr *parse_time(struct parser_state *state, int field, int unit) 
 	expr->stat_field = field;
 	expr->time_unit = unit;
 	return expr;
+}
+
+/**
+ * Parse -capable.
+ */
+static struct expr *parse_capable(struct parser_state *state, int flag, int arg2) {
+#if BFS_CAN_CHECK_CAPABILITIES
+	struct expr *expr = parse_nullary_test(state, eval_capable);
+	if (expr) {
+		expr->cost = STAT_COST;
+		expr->probability = 0.000002;
+	}
+	return expr;
+#else
+	parse_error(state, "${blu}%s${rs} is missing platform support.\n", state->argv[0]);
+	return NULL;
+#endif
 }
 
 /**
@@ -987,9 +1126,9 @@ static struct expr *parse_daystart(struct parser_state *state, int arg1, int arg
 	tm.tm_min = 0;
 	tm.tm_sec = 0;
 
-	time_t time = mktime(&tm);
-	if (time == -1) {
-		perror("mktime()");
+	time_t time;
+	if (xmktime(&tm, &time) != 0) {
+		perror("xmktime()");
 		return NULL;
 	}
 
@@ -1009,12 +1148,12 @@ static struct expr *parse_delete(struct parser_state *state, int arg1, int arg2)
 }
 
 /**
- * Parse -d, -depth.
+ * Parse -d.
  */
 static struct expr *parse_depth(struct parser_state *state, int arg1, int arg2) {
 	state->cmdline->flags |= BFTW_DEPTH;
 	state->depth_arg = state->argv[0];
-	return parse_nullary_option(state);
+	return parse_nullary_flag(state);
 }
 
 /**
@@ -1037,7 +1176,7 @@ static struct expr *parse_depth_limit(struct parser_state *state, int is_min, in
 	const char *arg = state->argv[0];
 	const char *value = state->argv[1];
 	if (!value) {
-		cfprintf(cmdline->cerr, "%{er}error: %s needs a value.%{rs}\n", arg);
+		parse_error(state, "${blu}%s${rs} needs a value.\n", arg);
 		return NULL;
 	}
 
@@ -1136,7 +1275,7 @@ static struct expr *parse_f(struct parser_state *state, int arg1, int arg2) {
 
 	const char *path = state->argv[0];
 	if (!path) {
-		cfprintf(state->cmdline->cerr, "%{er}error: -f requires a path.%{rs}\n");
+		parse_error(state, "${cyn}-f${rs} requires a path.\n");
 		return NULL;
 	}
 
@@ -1214,13 +1353,13 @@ static struct expr *parse_fprintf(struct parser_state *state, int arg1, int arg2
 
 	const char *file = state->argv[1];
 	if (!file) {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s needs a file.%{rs}\n", arg);
+		parse_error(state, "${blu}%s${rs} needs a file.\n", arg);
 		return NULL;
 	}
 
 	const char *format = state->argv[2];
 	if (!format) {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s needs a format string.%{rs}\n", arg);
+		parse_error(state, "${blu}%s${rs} needs a format string.\n", arg);
 		return NULL;
 	}
 
@@ -1255,11 +1394,8 @@ fail:
 static struct expr *parse_fstype(struct parser_state *state, int arg1, int arg2) {
 	struct cmdline *cmdline = state->cmdline;
 	if (!cmdline->mtab) {
-		cmdline->mtab = parse_bfs_mtab();
-		if (!cmdline->mtab) {
-			cfprintf(cmdline->cerr, "%{er}error: Couldn't parse the mount table: %m%{rs}\n");
-			return NULL;
-		}
+		parse_error(state, "Couldn't parse the mount table: %s.\n", strerror(cmdline->mtab_error));
+		return NULL;
 	}
 
 	struct expr *expr = parse_unary_test(state, eval_fstype);
@@ -1273,6 +1409,12 @@ static struct expr *parse_fstype(struct parser_state *state, int arg1, int arg2)
  * Parse -gid/-group.
  */
 static struct expr *parse_group(struct parser_state *state, int arg1, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	if (!cmdline->groups) {
+		parse_error(state, "Couldn't parse the group table: %s.\n", strerror(cmdline->groups_error));
+		return NULL;
+	}
+
 	const char *arg = state->argv[0];
 
 	struct expr *expr = parse_unary_test(state, eval_gid);
@@ -1280,7 +1422,7 @@ static struct expr *parse_group(struct parser_state *state, int arg1, int arg2) 
 		return NULL;
 	}
 
-	struct group *grp = getgrnam(expr->sdata);
+	const struct group *grp = bfs_getgrnam(cmdline->groups, expr->sdata);
 	if (grp) {
 		expr->idata = grp->gr_gid;
 		expr->cmp_flag = CMP_EXACT;
@@ -1289,7 +1431,7 @@ static struct expr *parse_group(struct parser_state *state, int arg1, int arg2) 
 			goto fail;
 		}
 	} else {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s %s: No such group.%{rs}\n", arg, expr->sdata);
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: No such group.\n", arg, expr->sdata);
 		goto fail;
 	}
 
@@ -1300,6 +1442,14 @@ static struct expr *parse_group(struct parser_state *state, int arg1, int arg2) 
 fail:
 	free_expr(expr);
 	return NULL;
+}
+
+/**
+ * Parse -unique.
+ */
+static struct expr *parse_unique(struct parser_state *state, int arg1, int arg2) {
+	state->cmdline->unique = true;
+	return parse_nullary_option(state);
 }
 
 /**
@@ -1317,6 +1467,12 @@ static struct expr *parse_used(struct parser_state *state, int arg1, int arg2) {
  * Parse -uid/-user.
  */
 static struct expr *parse_user(struct parser_state *state, int arg1, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	if (!cmdline->users) {
+		parse_error(state, "Couldn't parse the user table: %s.\n", strerror(cmdline->users_error));
+		return NULL;
+	}
+
 	const char *arg = state->argv[0];
 
 	struct expr *expr = parse_unary_test(state, eval_uid);
@@ -1324,7 +1480,7 @@ static struct expr *parse_user(struct parser_state *state, int arg1, int arg2) {
 		return NULL;
 	}
 
-	struct passwd *pwd = getpwnam(expr->sdata);
+	const struct passwd *pwd = bfs_getpwnam(cmdline->users, expr->sdata);
 	if (pwd) {
 		expr->idata = pwd->pw_uid;
 		expr->cmp_flag = CMP_EXACT;
@@ -1333,7 +1489,7 @@ static struct expr *parse_user(struct parser_state *state, int arg1, int arg2) {
 			goto fail;
 		}
 	} else {
-		cfprintf(state->cmdline->cerr, "%{er}error: %s %s: No such user.%{rs}\n", arg, expr->sdata);
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: No such user.\n", arg, expr->sdata);
 		goto fail;
 	}
 
@@ -1402,10 +1558,16 @@ static struct expr *parse_ls(struct parser_state *state, int arg1, int arg2) {
 }
 
 /**
- * Parse -mount, -xdev.
+ * Parse -mount.
  */
 static struct expr *parse_mount(struct parser_state *state, int arg1, int arg2) {
+	parse_warning(state,
+	              "In the future, ${blu}%s${rs} will skip mount points entirely, unlike\n"
+	              "${blu}-xdev${rs}, due to http://austingroupbugs.net/view.php?id=1133.\n\n",
+	              state->argv[0]);
+
 	state->cmdline->flags |= BFTW_XDEV;
+	state->mount_arg = state->argv[0];
 	return parse_nullary_option(state);
 }
 
@@ -1421,7 +1583,7 @@ static struct expr *parse_fnmatch(const struct parser_state *state, struct expr 
 #ifdef FNM_CASEFOLD
 		expr->idata = FNM_CASEFOLD;
 #else
-		cfprintf(state->cmdline->cerr, "%{er}error: %s is missing platform support.%{rs}\n", expr->argv[0]);
+		parse_error(state, "${blu}%s${rs} is missing platform support.\n", expr->argv[0]);
 		free_expr(expr);
 		return NULL;
 #endif
@@ -1464,15 +1626,74 @@ static struct expr *parse_lname(struct parser_state *state, int casefold, int ar
 	return parse_fnmatch(state, expr, casefold);
 }
 
+/** Get the bfs_stat_field for X/Y in -newerXY. */
+static enum bfs_stat_field parse_newerxy_field(char c) {
+	switch (c) {
+	case 'a':
+		return BFS_STAT_ATIME;
+	case 'B':
+		return BFS_STAT_BTIME;
+	case 'c':
+		return BFS_STAT_CTIME;
+	case 'm':
+		return BFS_STAT_MTIME;
+	default:
+		return 0;
+	}
+}
+
+/** Parse an explicit reference timestamp for -newerXt and -*since. */
+static int parse_reftime(const struct parser_state *state, struct expr *expr) {
+	if (parse_timestamp(expr->sdata, &expr->reftime) == 0) {
+		return 0;
+	} else if (errno != EINVAL) {
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: %m.\n", expr->argv[0], expr->argv[1]);
+		return -1;
+	}
+
+	parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Invalid timestamp.\n\n", expr->argv[0], expr->argv[1]);
+	fprintf(stderr, "Supported timestamp formats are ISO 8601-like, e.g.\n\n");
+
+	struct tm tm;
+	if (xlocaltime(&state->now.tv_sec, &tm) != 0) {
+		perror("xlocaltime()");
+		return -1;
+	}
+
+	int year = tm.tm_year + 1900;
+	int month = tm.tm_mon + 1;
+	fprintf(stderr, "  - %04d-%02d-%02d\n", year, month, tm.tm_mday);
+	fprintf(stderr, "  - %04d-%02d-%02dT%02d:%02d:%02d\n", year, month, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+#if __FreeBSD__
+	int gmtoff = tm.tm_gmtoff;
+#else
+	int gmtoff = -timezone;
+#endif
+	int tz_hour = gmtoff/3600;
+	int tz_min = (labs(gmtoff)/60)%60;
+	fprintf(stderr, "  - %04d-%02d-%02dT%02d:%02d:%02d%+03d:%02d\n",
+	        year, month, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, tz_hour, tz_min);
+
+	if (xgmtime(&state->now.tv_sec, &tm) != 0) {
+		perror("xgmtime()");
+		return -1;
+	}
+
+	year = tm.tm_year + 1900;
+	month = tm.tm_mon + 1;
+	fprintf(stderr, "  - %04d-%02d-%02dT%02d:%02d:%02dZ\n", year, month, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+	return -1;
+}
+
 /**
  * Parse -newerXY.
  */
 static struct expr *parse_newerxy(struct parser_state *state, int arg1, int arg2) {
-	CFILE *cerr = state->cmdline->cerr;
-
 	const char *arg = state->argv[0];
 	if (strlen(arg) != 8) {
-		cfprintf(cerr, "%{er}error: Expected -newerXY; found %s.%{rs}\n", arg);
+		parse_error(state, "Expected ${blu}-newer${bld}XY${rs}; found ${blu}-newer${bld}%s${rs}.\n", arg + 6);
 		return NULL;
 	}
 
@@ -1481,59 +1702,43 @@ static struct expr *parse_newerxy(struct parser_state *state, int arg1, int arg2
 		goto fail;
 	}
 
-	switch (arg[6]) {
-	case 'a':
-		expr->stat_field = BFS_STAT_ATIME;
-		break;
-	case 'c':
-		expr->stat_field = BFS_STAT_CTIME;
-		break;
-	case 'm':
-		expr->stat_field = BFS_STAT_MTIME;
-		break;
-	case 'B':
-		expr->stat_field = BFS_STAT_BTIME;
-		break;
-
-	default:
-		cfprintf(cerr, "%{er}error: %s: For -newerXY, X should be 'a', 'c', 'm', or 'B'.%{rs}\n", arg);
+	expr->stat_field = parse_newerxy_field(arg[6]);
+	if (!expr->stat_field) {
+		parse_error(state,
+		            "${blu}%s${rs}: For ${blu}-newer${bld}XY${rs}, ${bld}X${rs} should be ${bld}a${rs}, ${bld}c${rs}, ${bld}m${rs}, or ${bld}B${rs}, not ${er}%c${rs}.\n",
+		            arg, arg[6]);
 		goto fail;
 	}
 
 	if (arg[7] == 't') {
-		cfprintf(cerr, "%{er}error: %s: Explicit reference times ('t') are not supported.%{rs}\n", arg);
-		goto fail;
+		if (parse_reftime(state, expr) != 0) {
+			goto fail;
+		}
 	} else {
+		enum bfs_stat_field field = parse_newerxy_field(arg[7]);
+		if (!field) {
+			parse_error(state,
+			            "${blu}%s${rs}: For ${blu}-newer${bld}XY${rs}, ${bld}Y${rs} should be ${bld}a${rs}, ${bld}c${rs}, ${bld}m${rs}, ${bld}B${rs}, or ${bld}t${rs}, not ${er}%c${rs}.\n",
+			            arg, arg[7]);
+			goto fail;
+		}
+
 		struct bfs_stat sb;
 		if (stat_arg(state, expr, &sb) != 0) {
 			goto fail;
 		}
 
-		switch (arg[7]) {
-		case 'a':
-			expr->reftime = sb.atime;
-			break;
-		case 'c':
-			expr->reftime = sb.ctime;
-			break;
-		case 'm':
-			expr->reftime = sb.mtime;
-			break;
 
-		case 'B':
-			if (sb.mask & BFS_STAT_BTIME) {
-				expr->reftime = sb.btime;
-			} else {
-				cfprintf(cerr, "%{er}error: '%s': Couldn't get file birth time.%{rs}\n", expr->sdata);
-				goto fail;
-			}
-			break;
-
-		default:
-			cfprintf(cerr, "%{er}error: %s: For -newerXY, Y should be 'a', 'c', 'm', 'B', or 't'.%{rs}\n", arg);
+		const struct timespec *reftime = bfs_stat_time(&sb, field);
+		if (!reftime) {
+			parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Couldn't get file %s.\n", arg, expr->sdata, bfs_stat_field_name(field));
 			goto fail;
 		}
+
+		expr->reftime = *reftime;
 	}
+
+	expr->cost = STAT_COST;
 
 	return expr;
 
@@ -1546,9 +1751,16 @@ fail:
  * Parse -nogroup.
  */
 static struct expr *parse_nogroup(struct parser_state *state, int arg1, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	if (!cmdline->groups) {
+		parse_error(state, "Couldn't parse the group table: %s.\n", strerror(cmdline->groups_error));
+		return NULL;
+	}
+
 	struct expr *expr = parse_nullary_test(state, eval_nogroup);
 	if (expr) {
 		expr->cost = 9000.0;
+		expr->probability = 0.01;
 	}
 	return expr;
 }
@@ -1565,12 +1777,7 @@ static struct expr *parse_nohidden(struct parser_state *state, int arg1, int arg
  * Parse -noleaf.
  */
 static struct expr *parse_noleaf(struct parser_state *state, int arg1, int arg2) {
-	if (state->warn) {
-		cfprintf(state->cmdline->cerr,
-		         "%{wr}warning: bfs does not apply the optimization that %s inhibits.%{rs}\n\n",
-		         state->argv[0]);
-	}
-
+	parse_warning(state, "${ex}bfs${rs} does not apply the optimization that ${blu}%s${rs} inhibits.\n\n", state->argv[0]);
 	return parse_nullary_option(state);
 }
 
@@ -1578,9 +1785,16 @@ static struct expr *parse_noleaf(struct parser_state *state, int arg1, int arg2)
  * Parse -nouser.
  */
 static struct expr *parse_nouser(struct parser_state *state, int arg1, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	if (!cmdline->users) {
+		parse_error(state, "Couldn't parse the user table: %s.\n", strerror(cmdline->users_error));
+		return NULL;
+	}
+
 	struct expr *expr = parse_nullary_test(state, eval_nouser);
 	if (expr) {
 		expr->cost = 9000.0;
+		expr->probability = 0.01;
 	}
 	return expr;
 }
@@ -1800,7 +2014,7 @@ done:
 	return 0;
 
 fail:
-	cfprintf(state->cmdline->cerr, "%{er}error: '%s' is an invalid mode.%{rs}\n", mode);
+	parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Invalid mode.\n", expr->argv[0], mode);
 	return -1;
 }
 
@@ -1829,6 +2043,7 @@ static struct expr *parse_perm(struct parser_state *state, int field, int arg2) 
 			++mode;
 			break;
 		}
+		// Fallthrough
 	default:
 		expr->mode_cmp = MODE_EXACT;
 		break;
@@ -1943,7 +2158,7 @@ static struct expr *parse_regex(struct parser_state *state, int flags, int arg2)
 	if (err != 0) {
 		char *str = xregerror(err, expr->regex);
 		if (str) {
-			cfprintf(state->cmdline->cerr, "%{er}error: %s %s: %s.%{rs}\n", expr->argv[0], expr->argv[1], str);
+			parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: %s.\n", expr->argv[0], expr->argv[1], str);
 			free(str);
 		} else {
 			perror("xregerror()");
@@ -1973,13 +2188,15 @@ static struct expr *parse_regex_extended(struct parser_state *state, int arg1, i
  * Parse -regextype TYPE.
  */
 static struct expr *parse_regextype(struct parser_state *state, int arg1, int arg2) {
-	const char *type;
-	struct expr *expr = parse_unary_positional_option(state, &type);
-	if (!expr) {
-		goto fail;
-	}
+	struct cmdline *cmdline = state->cmdline;
+	CFILE *cfile = cmdline->cerr;
 
-	FILE *file = stderr;
+	const char *arg = state->argv[0];
+	const char *type = state->argv[1];
+	if (!type) {
+		parse_error(state, "${blu}%s${rs} needs a value.\n\n", arg);
+		goto list_types;
+	}
 
 	if (strcmp(type, "posix-basic") == 0) {
 		state->regex_flags = 0;
@@ -1987,23 +2204,28 @@ static struct expr *parse_regextype(struct parser_state *state, int arg1, int ar
 		state->regex_flags = REG_EXTENDED;
 	} else if (strcmp(type, "help") == 0) {
 		state->just_info = true;
-		file = stdout;
-		goto fail_list_types;
+		cfile = cmdline->cout;
+		goto list_types;
 	} else {
-		goto fail_bad_type;
+		parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Unsupported regex type.\n\n", arg, type);
+		goto list_types;
 	}
 
-	return expr;
+	return parse_unary_positional_option(state);
 
-fail_bad_type:
-	cfprintf(state->cmdline->cerr, "%{er}error: Unsupported -regextype '%s'.%{rs}\n\n", type);
-fail_list_types:
-	fputs("Supported types are:\n\n", file);
-	fputs("  posix-basic:    POSIX basic regular expressions (BRE)\n", file);
-	fputs("  posix-extended: POSIX extended regular expressions (ERE)\n", file);
-fail:
-	free_expr(expr);
+list_types:
+	cfprintf(cfile, "Supported types are:\n\n");
+	cfprintf(cfile, "  ${bld}posix-basic${rs}:    POSIX basic regular expressions (BRE)\n");
+	cfprintf(cfile, "  ${bld}posix-extended${rs}: POSIX extended regular expressions (ERE)\n");
 	return NULL;
+}
+
+/**
+ * Parse -s.
+ */
+static struct expr *parse_s(struct parser_state *state, int arg1, int arg2) {
+	state->cmdline->flags |= BFTW_SORT;
+	return parse_nullary_flag(state);
 }
 
 /**
@@ -2028,6 +2250,68 @@ static struct expr *parse_samefile(struct parser_state *state, int arg1, int arg
 	expr->probability = 0.01;
 
 	return expr;
+}
+
+/**
+ * Parse -S STRATEGY.
+ */
+static struct expr *parse_search_strategy(struct parser_state *state, int arg1, int arg2) {
+	struct cmdline *cmdline = state->cmdline;
+	CFILE *cfile = cmdline->cerr;
+
+	const char *flag = state->argv[0];
+	const char *arg = state->argv[1];
+	if (!arg) {
+		parse_error(state, "${cyn}%s${rs} needs an argument.\n\n", flag);
+		goto list_strategies;
+	}
+
+
+	if (strcmp(arg, "bfs") == 0) {
+		cmdline->strategy = BFTW_BFS;
+	} else if (strcmp(arg, "dfs") == 0) {
+		cmdline->strategy = BFTW_DFS;
+	} else if (strcmp(arg, "ids") == 0) {
+		cmdline->strategy = BFTW_IDS;
+	} else if (strcmp(arg, "help") == 0) {
+		state->just_info = true;
+		cfile = cmdline->cout;
+		goto list_strategies;
+	} else {
+		parse_error(state, "${cyn}%s${rs} ${bld}%s${rs}: Unrecognized search strategy.\n\n", flag, arg);
+		goto list_strategies;
+	}
+
+	return parse_unary_flag(state);
+
+list_strategies:
+	cfprintf(cfile, "Supported search strategies:\n\n");
+	cfprintf(cfile, "  ${bld}bfs${rs}: breadth-first search\n");
+	cfprintf(cfile, "  ${bld}dfs${rs}: depth-first search\n");
+	cfprintf(cfile, "  ${bld}ids${rs}: iterative deepening search\n");
+	return NULL;
+}
+
+/**
+ * Parse -[aBcm]?since.
+ */
+static struct expr *parse_since(struct parser_state *state, int field, int arg2) {
+	struct expr *expr = parse_unary_test(state, eval_newer);
+	if (!expr) {
+		return NULL;
+	}
+
+	if (parse_reftime(state, expr) != 0) {
+		goto fail;
+	}
+
+	expr->cost = STAT_COST;
+	expr->stat_field = field;
+	return expr;
+
+fail:
+	free_expr(expr);
+	return NULL;
 }
 
 /**
@@ -2085,9 +2369,8 @@ static struct expr *parse_size(struct parser_state *state, int arg1, int arg2) {
 	return expr;
 
 bad_unit:
-	cfprintf(state->cmdline->cerr,
-	         "%{er}error: %s %s: Expected a size unit (one of cwbkMGTP); found %s.%{rs}\n",
-	         expr->argv[0], expr->argv[1], unit);
+	parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Expected a size unit (one of ${bld}cwbkMGTP${rs}); found ${er}%s${rs}.\n",
+	            expr->argv[0], expr->argv[1], unit);
 fail:
 	free_expr(expr);
 	return NULL;
@@ -2119,51 +2402,60 @@ static struct expr *parse_type(struct parser_state *state, int x, int arg2) {
 
 	const char *c = expr->sdata;
 	while (true) {
+		enum bftw_typeflag type;
+		double type_prob;
+
 		switch (*c) {
 		case 'b':
-			types |= BFTW_BLK;
-			probability += 0.00000721183;
+			type = BFTW_BLK;
+			type_prob = 0.00000721183;
 			break;
 		case 'c':
-			types |= BFTW_CHR;
-			probability += 0.0000499855;
+			type = BFTW_CHR;
+			type_prob = 0.0000499855;
 			break;
 		case 'd':
-			types |= BFTW_DIR;
-			probability += 0.114475;
+			type = BFTW_DIR;
+			type_prob = 0.114475;
 			break;
 		case 'D':
-			types |= BFTW_DOOR;
-			probability += 0.000001;
+			type = BFTW_DOOR;
+			type_prob = 0.000001;
 			break;
 		case 'p':
-			types |= BFTW_FIFO;
-			probability += 0.00000248684;
+			type = BFTW_FIFO;
+			type_prob = 0.00000248684;
 			break;
 		case 'f':
-			types |= BFTW_REG;
-			probability += 0.859772;
+			type = BFTW_REG;
+			type_prob = 0.859772;
 			break;
 		case 'l':
-			types |= BFTW_LNK;
-			probability += 0.0256816;
+			type = BFTW_LNK;
+			type_prob = 0.0256816;
 			break;
 		case 's':
-			types |= BFTW_SOCK;
-			probability += 0.0000116881;
+			type = BFTW_SOCK;
+			type_prob = 0.0000116881;
+			break;
+		case 'w':
+			type = BFTW_WHT;
+			type_prob = 0.000001;
 			break;
 
 		case '\0':
-			cfprintf(state->cmdline->cerr,
-			         "%{er}error: %s %s: Expected a type flag.%{rs}\n",
-			         expr->argv[0], expr->argv[1]);
+			parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Expected a type flag.\n", expr->argv[0], expr->argv[1]);
 			goto fail;
 
 		default:
-			cfprintf(state->cmdline->cerr,
-			         "%{er}error: %s %s: Unknown type flag '%c' (expected one of [bcdpflsD]).%{rs}\n",
-			         expr->argv[0], expr->argv[1], *c);
+			parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Unknown type flag ${er}%c${rs} (expected one of [${bld}bcdpflsD${rs}]).\n",
+			            expr->argv[0], expr->argv[1], *c);
 			goto fail;
+		}
+
+		if (!(types & type)) {
+			types |= type;
+			probability += type_prob;
 		}
 
 		++c;
@@ -2173,9 +2465,7 @@ static struct expr *parse_type(struct parser_state *state, int x, int arg2) {
 			++c;
 			continue;
 		} else {
-			cfprintf(state->cmdline->cerr,
-			         "%{er}error: %s %s: Types must be comma-separated.%{rs}\n",
-			         expr->argv[0], expr->argv[1]);
+			parse_error(state, "${blu}%s${rs} ${bld}%s${rs}: Types must be comma-separated.\n", expr->argv[0], expr->argv[1]);
 			goto fail;
 		}
 	}
@@ -2201,8 +2491,139 @@ fail:
  * Parse -(no)?warn.
  */
 static struct expr *parse_warn(struct parser_state *state, int warn, int arg2) {
-	state->warn = warn;
+	state->cmdline->warn = warn;
 	return parse_nullary_positional_option(state);
+}
+
+/**
+ * Parse -xattr.
+ */
+static struct expr *parse_xattr(struct parser_state *state, int arg1, int arg2) {
+#if BFS_CAN_CHECK_XATTRS
+	struct expr *expr = parse_nullary_test(state, eval_xattr);
+	if (expr) {
+		expr->cost = STAT_COST;
+		expr->probability = 0.01;
+	}
+	return expr;
+#else
+	parse_error(state, "${blu}%s${rs} is missing platform support.\n", state->argv[0]);
+	return NULL;
+#endif
+}
+
+/**
+ * Parse -xdev.
+ */
+static struct expr *parse_xdev(struct parser_state *state, int arg1, int arg2) {
+	state->cmdline->flags |= BFTW_XDEV;
+	state->xdev_arg = state->argv[0];
+	return parse_nullary_option(state);
+}
+
+/**
+ * Launch a pager for the help output.
+ */
+static CFILE *launch_pager(pid_t *pid, CFILE *cout) {
+	char *pager = getenv("PAGER");
+	if (!pager) {
+		pager = "more";
+	}
+
+	int pipefd[2];
+	if (pipe(pipefd) != 0) {
+		goto fail;
+	}
+
+	FILE *file = fdopen(pipefd[1], "w");
+	if (!file) {
+		goto fail_pipe;
+	}
+	pipefd[1] = -1;
+
+	CFILE *ret = cfdup(file, NULL);
+	if (!ret) {
+		goto fail_file;
+	}
+	file = NULL;
+	ret->close = true;
+	ret->colors = cout->colors;
+
+	struct bfs_spawn ctx;
+	if (bfs_spawn_init(&ctx) != 0) {
+		goto fail_ret;
+	}
+
+	if (bfs_spawn_setflags(&ctx, BFS_SPAWN_USEPATH) != 0) {
+		goto fail_ctx;
+	}
+
+	if (bfs_spawn_addclose(&ctx, fileno(ret->file)) != 0) {
+		goto fail_ctx;
+	}
+	if (bfs_spawn_adddup2(&ctx, pipefd[0], STDIN_FILENO) != 0) {
+		goto fail_ctx;
+	}
+	if (bfs_spawn_addclose(&ctx, pipefd[0]) != 0) {
+		goto fail_ctx;
+	}
+
+	char *argv[] = {
+		pager,
+		NULL,
+	};
+
+	extern char **environ;
+	char **envp = environ;
+
+	if (!getenv("LESS")) {
+		size_t envc;
+		for (envc = 0; environ[envc]; ++envc);
+		++envc;
+
+		envp = malloc((envc + 1)*sizeof(*envp));
+		if (!envp) {
+			goto fail_ctx;
+		}
+
+		memcpy(envp, environ, (envc - 1)*sizeof(*envp));
+		envp[envc - 1] = "LESS=FKRX";
+		envp[envc] = NULL;
+	}
+
+	*pid = bfs_spawn(pager, &ctx, argv, envp);
+	if (*pid < 0) {
+		goto fail_envp;
+	}
+
+	close(pipefd[0]);
+	if (envp != environ) {
+		free(envp);
+	}
+	bfs_spawn_destroy(&ctx);
+	return ret;
+
+fail_envp:
+	if (envp != environ) {
+		free(envp);
+	}
+fail_ctx:
+	bfs_spawn_destroy(&ctx);
+fail_ret:
+	cfclose(ret);
+fail_file:
+	if (file) {
+		fclose(file);
+	}
+fail_pipe:
+	if (pipefd[1] >= 0) {
+		close(pipefd[1]);
+	}
+	if (pipefd[0] >= 0) {
+		close(pipefd[0]);
+	}
+fail:
+	return cout;
 }
 
 /**
@@ -2210,251 +2631,249 @@ static struct expr *parse_warn(struct parser_state *state, int warn, int arg2) {
  */
 static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
 	CFILE *cout = state->cmdline->cout;
-	cfprintf(cout, "Usage: %{ex}%s%{rs} [%{cyn}flags%{rs}...] [%{mag}paths%{rs}...] [%{blu}expression%{rs}...]\n\n",
+
+	pid_t pager = -1;
+	if (state->stdout_tty) {
+		cout = launch_pager(&pager, cout);
+	}
+
+	cfprintf(cout, "Usage: ${ex}%s${rs} [${cyn}flags${rs}...] [${mag}paths${rs}...] [${blu}expression${rs}...]\n\n",
 		 state->command);
 
-	cfprintf(cout, "%{ex}bfs%{rs} is compatible with %{ex}find%{rs}; see %{ex}find%{rs} %{blu}-help%{rs} or"
-	               " %{ex}man%{rs} %{bld}find%{rs} for help with %{ex}find%{rs}-\n"
-	               "compatible options :)\n\n");
+	cfprintf(cout, "${ex}bfs${rs} is compatible with ${ex}find${rs}, with some extensions. "
+		       "${cyn}Flags${rs} (${cyn}-H${rs}/${cyn}-L${rs}/${cyn}-P${rs} etc.), ${mag}paths${rs},\n"
+		       "and ${blu}expressions${rs} may be freely mixed in any order.\n\n");
 
-	cfprintf(cout, "%{cyn}flags%{rs} (%{cyn}-H%{rs}/%{cyn}-L%{rs}/%{cyn}-P%{rs} etc.), %{mag}paths%{rs}, and"
-	               " %{blu}expressions%{rs} may be freely mixed in any order.\n\n");
+	cfprintf(cout, "${bld}Flags:${rs}\n\n");
 
-	cfprintf(cout, "%{bld}POSIX find features:%{rs}\n\n");
-
-	cfprintf(cout, "  %{red}(%{rs} %{blu}expression%{rs} %{red})%{rs}\n");
-	cfprintf(cout, "  %{red}!%{rs} %{blu}expression%{rs}\n");
-	cfprintf(cout, "  %{blu}expression%{rs} [%{red}-a%{rs}] %{blu}expression%{rs}\n");
-	cfprintf(cout, "  %{blu}expression%{rs} %{red}-o%{rs} %{blu}expression%{rs}\n\n");
-
-	cfprintf(cout, "  %{cyn}-H%{rs}\n");
+	cfprintf(cout, "  ${cyn}-H${rs}\n");
 	cfprintf(cout, "      Follow symbolic links on the command line, but not while searching\n");
-	cfprintf(cout, "  %{cyn}-L%{rs}\n");
-	cfprintf(cout, "      Follow all symbolic links\n\n");
+	cfprintf(cout, "  ${cyn}-L${rs}\n");
+	cfprintf(cout, "      Follow all symbolic links\n");
+	cfprintf(cout, "  ${cyn}-P${rs}\n");
+	cfprintf(cout, "      Never follow symbolic links (the default)\n");
 
-	cfprintf(cout, "  %{blu}-depth%{rs}\n");
+	cfprintf(cout, "  ${cyn}-E${rs}\n");
+	cfprintf(cout, "      Use extended regular expressions (same as ${blu}-regextype${rs} ${bld}posix-extended${rs})\n");
+	cfprintf(cout, "  ${cyn}-X${rs}\n");
+	cfprintf(cout, "      Filter out files with non-${ex}xargs${rs}-safe names\n");
+	cfprintf(cout, "  ${cyn}-d${rs}\n");
+	cfprintf(cout, "      Search in post-order (same as ${blu}-depth${rs})\n");
+	cfprintf(cout, "  ${cyn}-s${rs}\n");
+	cfprintf(cout, "      Visit directory entries in sorted order\n");
+	cfprintf(cout, "  ${cyn}-x${rs}\n");
+	cfprintf(cout, "      Don't descend into other mount points (same as ${blu}-xdev${rs})\n");
+
+	cfprintf(cout, "  ${cyn}-f${rs} ${mag}PATH${rs}\n");
+	cfprintf(cout, "      Treat ${mag}PATH${rs} as a path to search (useful if begins with a dash)\n");
+	cfprintf(cout, "  ${cyn}-D${rs} ${bld}FLAG${rs}\n");
+	cfprintf(cout, "      Turn on a debugging flag (see ${cyn}-D${rs} ${bld}help${rs})\n");
+	cfprintf(cout, "  ${cyn}-O${bld}N${rs}\n");
+	cfprintf(cout, "      Enable optimization level ${bld}N${rs} (default: 3)\n");
+	cfprintf(cout, "  ${cyn}-S${rs} ${bld}bfs${rs}|${bld}dfs${rs}|${bld}ids${rs}\n");
+	cfprintf(cout, "      Use ${bld}b${rs}readth-${bld}f${rs}irst/${bld}d${rs}epth-${bld}f${rs}irst/${bld}i${rs}terative ${bld}d${rs}eepening ${bld}s${rs}earch (default: ${cyn}-S${rs} ${bld}bfs${rs})\n\n");
+
+	cfprintf(cout, "${bld}Operators:${rs}\n\n");
+
+	cfprintf(cout, "  ${red}(${rs} ${blu}expression${rs} ${red})${rs}\n\n");
+
+	cfprintf(cout, "  ${red}!${rs} ${blu}expression${rs}\n");
+	cfprintf(cout, "  ${red}-not${rs} ${blu}expression${rs}\n\n");
+
+	cfprintf(cout, "  ${blu}expression${rs} ${blu}expression${rs}\n");
+	cfprintf(cout, "  ${blu}expression${rs} ${red}-a${rs} ${blu}expression${rs}\n");
+	cfprintf(cout, "  ${blu}expression${rs} ${red}-and${rs} ${blu}expression${rs}\n\n");
+
+	cfprintf(cout, "  ${blu}expression${rs} ${red}-o${rs} ${blu}expression${rs}\n");
+	cfprintf(cout, "  ${blu}expression${rs} ${red}-or${rs} ${blu}expression${rs}\n\n");
+
+	cfprintf(cout, "  ${blu}expression${rs} ${red},${rs} ${blu}expression${rs}\n\n");
+
+	cfprintf(cout, "${bld}Options:${rs}\n\n");
+
+	cfprintf(cout, "  ${blu}-color${rs}\n");
+	cfprintf(cout, "  ${blu}-nocolor${rs}\n");
+	cfprintf(cout, "      Turn colors on or off (default: ${blu}-color${rs} if outputting to a terminal,\n");
+	cfprintf(cout, "      ${blu}-nocolor${rs} otherwise)\n");
+	cfprintf(cout, "  ${blu}-daystart${rs}\n");
+	cfprintf(cout, "      Measure times relative to the start of today\n");
+	cfprintf(cout, "  ${blu}-depth${rs}\n");
 	cfprintf(cout, "      Search in post-order (descendents first)\n");
-	cfprintf(cout, "  %{blu}-xdev%{rs}\n");
+	cfprintf(cout, "  ${blu}-follow${rs}\n");
+	cfprintf(cout, "      Follow all symbolic links (same as ${cyn}-L${rs})\n");
+	cfprintf(cout, "  ${blu}-ignore_readdir_race${rs}\n");
+	cfprintf(cout, "  ${blu}-noignore_readdir_race${rs}\n");
+	cfprintf(cout, "      Whether to report an error if ${ex}bfs${rs} detects that the file tree is modified\n");
+	cfprintf(cout, "      during the search (default: ${blu}-noignore_readdir_race${rs})\n");
+	cfprintf(cout, "  ${blu}-maxdepth${rs} ${bld}N${rs}\n");
+	cfprintf(cout, "  ${blu}-mindepth${rs} ${bld}N${rs}\n");
+	cfprintf(cout, "      Ignore files deeper/shallower than ${bld}N${rs}\n");
+	cfprintf(cout, "  ${blu}-mount${rs}\n");
+	cfprintf(cout, "      Don't descend into other mount points (same as ${blu}-xdev${rs} for now, but will\n");
+	cfprintf(cout, "      skip mount points entirely in the future)\n");
+	cfprintf(cout, "  ${blu}-noleaf${rs}\n");
+	cfprintf(cout, "      Ignored; for compatibility with GNU find\n");
+	cfprintf(cout, "  ${blu}-regextype${rs} ${bld}TYPE${rs}\n");
+	cfprintf(cout, "      Use ${bld}TYPE${rs}-flavored regexes (default: ${bld}posix-basic${rs}; see ${blu}-regextype${rs}"
+	                " ${bld}help${rs})\n");
+	cfprintf(cout, "  ${blu}-unique${rs}\n");
+	cfprintf(cout, "      Skip any files that have already been seen\n");
+	cfprintf(cout, "  ${blu}-warn${rs}\n");
+	cfprintf(cout, "  ${blu}-nowarn${rs}\n");
+	cfprintf(cout, "      Turn on or off warnings about the command line\n");
+	cfprintf(cout, "  ${blu}-xdev${rs}\n");
 	cfprintf(cout, "      Don't descend into other mount points\n\n");
 
-	cfprintf(cout, "  %{blu}-atime%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-ctime%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-mtime%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files accessed/changed/modified %{bld}N%{rs} days ago\n");
-	cfprintf(cout, "  %{blu}-group%{rs} %{bld}NAME%{rs}\n");
-	cfprintf(cout, "  %{blu}-user%{rs}  %{bld}NAME%{rs}\n");
-	cfprintf(cout, "      Find files owned by the group/user %{bld}NAME%{rs}\n");
-	cfprintf(cout, "  %{blu}-links%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files with %{bld}N%{rs} hard links\n");
-	cfprintf(cout, "  %{blu}-name%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "      Find files whose name matches the %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-path%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "      Find files whose entire path matches the %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-newer%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Find files newer than %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-perm%{rs} %{bld}[-]MODE%{rs}\n");
-	cfprintf(cout, "      Find files with a matching mode\n");
-	cfprintf(cout, "  %{blu}-type%{rs} %{bld}[bcdlpfs]%{rs}\n");
-	cfprintf(cout, "      Find files of the given type\n");
-	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[c]%{rs}\n");
-	cfprintf(cout, "      Find files with the given size\n\n");
+	cfprintf(cout, "${bld}Tests:${rs}\n\n");
 
-	cfprintf(cout, "  %{blu}-prune%{rs}\n");
-	cfprintf(cout, "      Don't descend into this directory\n");
-	cfprintf(cout, "  %{blu}-exec%{rs} %{bld}command ... {} ;%{rs}\n");
-	cfprintf(cout, "      Execute a command\n");
-	cfprintf(cout, "  %{blu}-exec%{rs} %{bld}command ... {} +%{rs}\n");
-	cfprintf(cout, "      Execute a command with multiple files at once\n");
-	cfprintf(cout, "  %{blu}-ok%{rs} %{bld}command ... {} ;%{rs}\n");
-	cfprintf(cout, "      Prompt the user whether to execute a command\n");
-	cfprintf(cout, "  %{blu}-print%{rs}\n");
-	cfprintf(cout, "      Print the path to the found file\n\n");
-
-	cfprintf(cout, "%{bld}GNU find features:%{rs}\n\n");
-
-	cfprintf(cout, "  %{red}-not%{rs} %{blu}expression%{rs}\n");
-	cfprintf(cout, "  %{blu}expression%{rs} %{red}-and%{rs} %{blu}expression%{rs}\n");
-	cfprintf(cout, "  %{blu}expression%{rs} %{red}-or%{rs} %{blu}expression%{rs}\n");
-	cfprintf(cout, "  %{blu}expression%{rs} %{red},%{rs} %{blu}expression%{rs}\n\n");
-
-	cfprintf(cout, "  %{cyn}-P%{rs}\n");
-	cfprintf(cout, "      Never follow symbolic links (the default)\n");
-	cfprintf(cout, "  %{cyn}-D%{rs} %{bld}FLAG%{rs}\n");
-	cfprintf(cout, "      Turn on a debugging flag (see %{cyn}-D%{rs} %{bld}help%{rs})\n");
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}N%{rs}\n");
-	cfprintf(cout, "      Enable optimization level %{bld}N%{rs} (default: 3; interpreted differently than GNU\n");
-	cfprintf(cout, "      find -- see below)\n\n");
-
-	cfprintf(cout, "  %{blu}-d%{rs}\n");
-	cfprintf(cout, "      Search in post-order (same as %{blu}-depth%{rs})\n");
-	cfprintf(cout, "  %{blu}-daystart%{rs}\n");
-	cfprintf(cout, "      Measure times relative to the start of today\n");
-	cfprintf(cout, "  %{blu}-follow%{rs}\n");
-	cfprintf(cout, "      Follow all symbolic links (same as %{cyn}-L%{rs})\n");
-	cfprintf(cout, "  %{blu}-ignore_readdir_race%{rs}\n");
-	cfprintf(cout, "  %{blu}-noignore_readdir_race%{rs}\n");
-	cfprintf(cout, "      Whether to report an error if %{ex}bfs%{rs} detects that the file tree is modified\n");
-	cfprintf(cout, "      during the search (default: %{blu}-noignore_readdir_race%{rs})\n");
-	cfprintf(cout, "  %{blu}-maxdepth%{rs} %{bld}N%{rs}\n");
-	cfprintf(cout, "  %{blu}-mindepth%{rs} %{bld}N%{rs}\n");
-	cfprintf(cout, "      Ignore files deeper/shallower than %{bld}N%{rs}\n");
-	cfprintf(cout, "  %{blu}-mount%{rs}\n");
-	cfprintf(cout, "      Don't descend into other mount points (same as %{blu}-xdev%{rs})\n");
-	cfprintf(cout, "  %{blu}-noleaf%{rs}\n");
-	cfprintf(cout, "      Ignored; for compatibility with GNU find\n");
-	cfprintf(cout, "  %{blu}-regextype%{rs} %{bld}TYPE%{rs}\n");
-	cfprintf(cout, "      Use %{bld}TYPE%{rs}-flavored regexes (default: %{bld}posix-basic%{rs}; see %{blu}-regextype%{rs}"
-	                " %{bld}help%{rs})\n");
-	cfprintf(cout, "  %{blu}-warn%{rs}\n");
-	cfprintf(cout, "  %{blu}-nowarn%{rs}\n");
-	cfprintf(cout, "      Turn on or off warnings about the command line\n\n");
-
-	cfprintf(cout, "  %{blu}-amin%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-cmin%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-mmin%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files accessed/changed/modified %{bld}N%{rs} minutes ago\n");
-	cfprintf(cout, "  %{blu}-anewer%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-cnewer%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-mnewer%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Find files accessed/changed/modified more recently than %{bld}FILE%{rs} was modified\n");
-	cfprintf(cout, "  %{blu}-empty%{rs}\n");
+#if BFS_CAN_CHECK_ACL
+	cfprintf(cout, "  ${blu}-acl${rs}\n");
+	cfprintf(cout, "      Find files with a non-trivial Access Control List\n");
+#endif
+	cfprintf(cout, "  ${blu}-${rs}[${blu}aBcm${rs}]${blu}min${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files ${blu}a${rs}ccessed/${blu}B${rs}irthed/${blu}c${rs}hanged/${blu}m${rs}odified ${bld}N${rs} minutes ago\n");
+	cfprintf(cout, "  ${blu}-${rs}[${blu}aBcm${rs}]${blu}newer${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "      Find files ${blu}a${rs}ccessed/${blu}B${rs}irthed/${blu}c${rs}hanged/${blu}m${rs}odified more recently than ${bld}FILE${rs} was\n"
+	               "      modified\n");
+	cfprintf(cout, "  ${blu}-${rs}[${blu}aBcm${rs}]${blu}since${rs} ${bld}TIME${rs}\n");
+	cfprintf(cout, "      Find files ${blu}a${rs}ccessed/${blu}B${rs}irthed/${blu}c${rs}hanged/${blu}m${rs}odified more recently than ${bld}TIME${rs}\n");
+	cfprintf(cout, "  ${blu}-${rs}[${blu}aBcm${rs}]${blu}time${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files ${blu}a${rs}ccessed/${blu}B${rs}irthed/${blu}c${rs}hanged/${blu}m${rs}odified ${bld}N${rs} days ago\n");
+#if BFS_CAN_CHECK_CAPABILITIES
+	cfprintf(cout, "  ${blu}-capable${rs}\n");
+	cfprintf(cout, "      Find files with POSIX.1e capabilities set\n");
+#endif
+	cfprintf(cout, "  ${blu}-depth${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files with depth ${bld}N${rs}\n");
+	cfprintf(cout, "  ${blu}-empty${rs}\n");
 	cfprintf(cout, "      Find empty files/directories\n");
-	cfprintf(cout, "  %{blu}-executable%{rs}\n");
-	cfprintf(cout, "  %{blu}-readable%{rs}\n");
-	cfprintf(cout, "  %{blu}-writable%{rs}\n");
+	cfprintf(cout, "  ${blu}-executable${rs}\n");
+	cfprintf(cout, "  ${blu}-readable${rs}\n");
+	cfprintf(cout, "  ${blu}-writable${rs}\n");
 	cfprintf(cout, "      Find files the current user can execute/read/write\n");
-	cfprintf(cout, "  %{blu}-false%{rs}\n");
-	cfprintf(cout, "  %{blu}-true%{rs}\n");
+	cfprintf(cout, "  ${blu}-false${rs}\n");
+	cfprintf(cout, "  ${blu}-true${rs}\n");
 	cfprintf(cout, "      Always false/true\n");
-	cfprintf(cout, "  %{blu}-fstype%{rs} %{bld}TYPE%{rs}\n");
-	cfprintf(cout, "      Find files on file systems with the given %{bld}TYPE%{rs}\n");
-	cfprintf(cout, "  %{blu}-gid%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-uid%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files owned by group/user ID %{bld}N%{rs}\n");
-	cfprintf(cout, "  %{blu}-inum%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files with inode number %{bld}N%{rs}\n");
-	cfprintf(cout, "  %{blu}-lname%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "      Find symbolic links whose target matches the %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-newer%{rs}%{bld}XY%{rs} %{bld}REFERENCE%{rs}\n");
-	cfprintf(cout, "      Find files whose %{bld}X%{rs} time is newer than the %{bld}Y%{rs} time of"
-	               " %{bld}REFERENCE%{rs}.  %{bld}X%{rs} and %{bld}Y%{rs}\n");
-	cfprintf(cout, "      can be any of [aBcm].\n");
-	cfprintf(cout, "  %{blu}-regex%{rs} %{bld}REGEX%{rs}\n");
-	cfprintf(cout, "      Find files whose entire path matches the regular expression %{bld}REGEX%{rs}\n");
-	cfprintf(cout, "  %{blu}-samefile%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Find hard links to %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[cwbkMG]%{rs}\n");
-	cfprintf(cout, "      1-byte %{bld}c%{rs}haracters, 2-byte %{bld}w%{rs}ords, 512-byte %{bld}b%{rs}locks, and"
-	               " %{bld}k%{rs}iB/%{bld}M%{rs}iB/%{bld}G%{rs}iB\n");
-	cfprintf(cout, "  %{blu}-type%{rs} %{bld}[bcdlpfsD]%{rs}\n");
-	cfprintf(cout, "      The %{bld}D%{rs}oor file type is also supported on platforms that have it (Solaris)\n");
-	cfprintf(cout, "  %{blu}-used%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files last accessed %{bld}N%{rs} days after they were changed\n");
-	cfprintf(cout, "  %{blu}-wholename%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "      Find files whose entire path matches the %{bld}GLOB%{rs} (same as %{blu}-path%{rs})\n");
-	cfprintf(cout, "  %{blu}-ilname%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-iname%{rs}  %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-ipath%{rs}  %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "  %{blu}-iregex%{rs} %{bld}REGEX%{rs}\n");
-	cfprintf(cout, "  %{blu}-iwholename%{rs} %{bld}GLOB%{rs}\n");
-	cfprintf(cout, "      Case-insensitive versions of %{blu}-lname%{rs}/%{blu}-name%{rs}/%{blu}-path%{rs}"
-	               "/%{blu}-regex%{rs}/%{blu}-wholename%{rs}\n");
-	cfprintf(cout, "  %{blu}-xtype%{rs} %{bld}[bcdlpfsD]%{rs}\n");
-	cfprintf(cout, "      Find files of the given type, following links when %{blu}-type%{rs} would not, and\n");
+	cfprintf(cout, "  ${blu}-fstype${rs} ${bld}TYPE${rs}\n");
+	cfprintf(cout, "      Find files on file systems with the given ${bld}TYPE${rs}\n");
+	cfprintf(cout, "  ${blu}-gid${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "  ${blu}-uid${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files owned by group/user ID ${bld}N${rs}\n");
+	cfprintf(cout, "  ${blu}-group${rs} ${bld}NAME${rs}\n");
+	cfprintf(cout, "  ${blu}-user${rs}  ${bld}NAME${rs}\n");
+	cfprintf(cout, "      Find files owned by the group/user ${bld}NAME${rs}\n");
+	cfprintf(cout, "  ${blu}-hidden${rs}\n");
+	cfprintf(cout, "  ${blu}-nohidden${rs}\n");
+	cfprintf(cout, "      Find hidden files, or filter them out\n");
+#ifdef FNM_CASEFOLD
+	cfprintf(cout, "  ${blu}-ilname${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-iname${rs}  ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-ipath${rs}  ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-iregex${rs} ${bld}REGEX${rs}\n");
+	cfprintf(cout, "  ${blu}-iwholename${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "      Case-insensitive versions of ${blu}-lname${rs}/${blu}-name${rs}/${blu}-path${rs}"
+	               "/${blu}-regex${rs}/${blu}-wholename${rs}\n");
+#endif
+	cfprintf(cout, "  ${blu}-inum${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files with inode number ${bld}N${rs}\n");
+	cfprintf(cout, "  ${blu}-links${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files with ${bld}N${rs} hard links\n");
+	cfprintf(cout, "  ${blu}-lname${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "      Find symbolic links whose target matches the ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-name${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "      Find files whose name matches the ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-newer${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "      Find files newer than ${bld}FILE${rs}\n");
+	cfprintf(cout, "  ${blu}-newer${bld}XY${rs} ${bld}REFERENCE${rs}\n");
+	cfprintf(cout, "      Find files whose ${bld}X${rs} time is newer than the ${bld}Y${rs} time of"
+	               " ${bld}REFERENCE${rs}.  ${bld}X${rs} and ${bld}Y${rs}\n");
+	cfprintf(cout, "      can be any of [${bld}aBcm${rs}].  ${bld}Y${rs} may also be ${bld}t${rs} to parse ${bld}REFERENCE${rs} an explicit\n");
+	cfprintf(cout, "      timestamp.\n");
+	cfprintf(cout, "  ${blu}-nogroup${rs}\n");
+	cfprintf(cout, "  ${blu}-nouser${rs}\n");
+	cfprintf(cout, "      Find files owned by nonexistent groups/users\n");
+	cfprintf(cout, "  ${blu}-path${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-wholename${rs} ${bld}GLOB${rs}\n");
+	cfprintf(cout, "      Find files whose entire path matches the ${bld}GLOB${rs}\n");
+	cfprintf(cout, "  ${blu}-perm${rs} ${bld}[-]MODE${rs}\n");
+	cfprintf(cout, "      Find files with a matching mode\n");
+	cfprintf(cout, "  ${blu}-regex${rs} ${bld}REGEX${rs}\n");
+	cfprintf(cout, "      Find files whose entire path matches the regular expression ${bld}REGEX${rs}\n");
+	cfprintf(cout, "  ${blu}-samefile${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "      Find hard links to ${bld}FILE${rs}\n");
+	cfprintf(cout, "  ${blu}-since${rs} ${bld}TIME${rs}\n");
+	cfprintf(cout, "      Find files modified since ${bld}TIME${rs}\n");
+	cfprintf(cout, "  ${blu}-size${rs} ${bld}[-+]N[cwbkMGTP]${rs}\n");
+	cfprintf(cout, "      Find files with the given size, in 1-byte ${bld}c${rs}haracters, 2-byte ${bld}w${rs}ords,\n");
+	cfprintf(cout, "      512-byte ${bld}b${rs}locks (default), or ${bld}k${rs}iB/${bld}M${rs}iB/${bld}G${rs}iB/${bld}T${rs}iB/${bld}P${rs}iB\n");
+	cfprintf(cout, "  ${blu}-sparse${rs}\n");
+	cfprintf(cout, "      Find files that occupy fewer disk blocks than expected\n");
+	cfprintf(cout, "  ${blu}-type${rs} ${bld}[bcdlpfswD]${rs}\n");
+	cfprintf(cout, "      Find files of the given type\n");
+	cfprintf(cout, "  ${blu}-used${rs} ${bld}[-+]N${rs}\n");
+	cfprintf(cout, "      Find files last accessed ${bld}N${rs} days after they were changed\n");
+#if BFS_CAN_CHECK_XATTRS
+	cfprintf(cout, "  ${blu}-xattr${rs}\n");
+	cfprintf(cout, "      Find files with extended attributes\n");
+#endif
+	cfprintf(cout, "  ${blu}-xtype${rs} ${bld}[bcdlpfswD]${rs}\n");
+	cfprintf(cout, "      Find files of the given type, following links when ${blu}-type${rs} would not, and\n");
 	cfprintf(cout, "      vice versa\n\n");
 
-	cfprintf(cout, "  %{blu}-delete%{rs}\n");
-	cfprintf(cout, "      Delete any found files (implies %{blu}-depth%{rs})\n");
-	cfprintf(cout, "  %{blu}-execdir%{rs} %{bld}command ... {} ;%{rs}\n");
-	cfprintf(cout, "  %{blu}-execdir%{rs} %{bld}command ... {} +%{rs}\n");
-	cfprintf(cout, "  %{blu}-okdir%{rs}   %{bld}command ... {} ;%{rs}\n");
-	cfprintf(cout, "      Like %{blu}-exec%{rs}/%{blu}-ok%{rs}, but run the command in the same directory as the found\n");
-	cfprintf(cout, "      file(s)\n");
-	cfprintf(cout, "  %{blu}-ls%{rs}\n");
-	cfprintf(cout, "      List files like %{ex}ls%{rs} %{bld}-dils%{rs}\n");
-	cfprintf(cout, "  %{blu}-print0%{rs}\n");
-	cfprintf(cout, "      Like %{blu}-print%{rs}, but use the null character ('\\0') as a separator rather than\n");
-	cfprintf(cout, "      newlines\n");
-	cfprintf(cout, "  %{blu}-printf%{rs} %{bld}FORMAT%{rs}\n");
-	cfprintf(cout, "      Print according to a format string (see %{ex}man%{rs} %{bld}find%{rs})\n");
-	cfprintf(cout, "  %{blu}-fls%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-fprint%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-fprint0%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "  %{blu}-fprintf%{rs} %{bld}FORMAT%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Like %{blu}-ls%{rs}/%{blu}-print%{rs}/%{blu}-print0%{rs}/%{blu}-printf%{rs}, but write to"
-	               " %{bld}FILE%{rs} instead of standard output\n");
-	cfprintf(cout, "  %{blu}-quit%{rs}\n");
-	cfprintf(cout, "      Quit immediately\n\n");
+	cfprintf(cout, "${bld}Actions:${rs}\n\n");
 
-	cfprintf(cout, "  %{blu}-version%{rs}\n");
+	cfprintf(cout, "  ${blu}-delete${rs}\n");
+	cfprintf(cout, "  ${blu}-rm${rs}\n");
+	cfprintf(cout, "      Delete any found files (implies ${blu}-depth${rs})\n");
+	cfprintf(cout, "  ${blu}-exec${rs} ${bld}command ... {} ;${rs}\n");
+	cfprintf(cout, "      Execute a command\n");
+	cfprintf(cout, "  ${blu}-exec${rs} ${bld}command ... {} +${rs}\n");
+	cfprintf(cout, "      Execute a command with multiple files at once\n");
+	cfprintf(cout, "  ${blu}-ok${rs} ${bld}command ... {} ;${rs}\n");
+	cfprintf(cout, "      Prompt the user whether to execute a command\n");
+	cfprintf(cout, "  ${blu}-execdir${rs} ${bld}command ... {} ;${rs}\n");
+	cfprintf(cout, "  ${blu}-execdir${rs} ${bld}command ... {} +${rs}\n");
+	cfprintf(cout, "  ${blu}-okdir${rs} ${bld}command ... {} ;${rs}\n");
+	cfprintf(cout, "      Like ${blu}-exec${rs}/${blu}-ok${rs}, but run the command in the same directory as the found\n");
+	cfprintf(cout, "      file(s)\n");
+	cfprintf(cout, "  ${blu}-exit${rs} [${bld}STATUS${rs}]\n");
+	cfprintf(cout, "      Exit immediately with the given status (%d if unspecified)\n", EXIT_SUCCESS);
+	cfprintf(cout, "  ${blu}-fls${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "  ${blu}-fprint${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "  ${blu}-fprint0${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "  ${blu}-fprintf${rs} ${bld}FORMAT${rs} ${bld}FILE${rs}\n");
+	cfprintf(cout, "      Like ${blu}-ls${rs}/${blu}-print${rs}/${blu}-print0${rs}/${blu}-printf${rs}, but write to ${bld}FILE${rs} instead of standard\n"
+	               "      output\n");
+	cfprintf(cout, "  ${blu}-ls${rs}\n");
+	cfprintf(cout, "      List files like ${ex}ls${rs} ${bld}-dils${rs}\n");
+	cfprintf(cout, "  ${blu}-nohidden${rs}\n");
+	cfprintf(cout, "      Filter out hidden files and directories\n");
+	cfprintf(cout, "  ${blu}-print${rs}\n");
+	cfprintf(cout, "      Print the path to the found file\n");
+	cfprintf(cout, "  ${blu}-print0${rs}\n");
+	cfprintf(cout, "      Like ${blu}-print${rs}, but use the null character ('\\0') as a separator rather than\n");
+	cfprintf(cout, "      newlines\n");
+	cfprintf(cout, "  ${blu}-printf${rs} ${bld}FORMAT${rs}\n");
+	cfprintf(cout, "      Print according to a format string (see ${ex}man${rs} ${bld}find${rs}).  The additional format\n");
+	cfprintf(cout, "      directives %%w and %%W${bld}k${rs} for printing file birth times are supported.\n");
+	cfprintf(cout, "  ${blu}-printx${rs}\n");
+	cfprintf(cout, "      Like ${blu}-print${rs}, but escape whitespace and quotation characters, to make the\n");
+	cfprintf(cout, "      output safe for ${ex}xargs${rs}.  Consider using ${blu}-print0${rs} and ${ex}xargs${rs} ${bld}-0${rs} instead.\n");
+	cfprintf(cout, "  ${blu}-prune${rs}\n");
+	cfprintf(cout, "      Don't descend into this directory\n");
+	cfprintf(cout, "  ${blu}-quit${rs}\n");
+	cfprintf(cout, "      Quit immediately\n");
+	cfprintf(cout, "  ${blu}-version${rs}\n");
 	cfprintf(cout, "      Print version information\n");
-	cfprintf(cout, "  %{blu}-help%{rs}\n");
+	cfprintf(cout, "  ${blu}-help${rs}\n");
 	cfprintf(cout, "      Print this help message\n\n");
 
-	cfprintf(cout, "%{bld}BSD find features:%{rs}\n\n");
-
-	cfprintf(cout, "  %{cyn}-E%{rs}\n");
-	cfprintf(cout, "      Use extended regular expressions (same as %{blu}-regextype%{rs} %{bld}posix-extended%{rs})\n");
-	cfprintf(cout, "  %{cyn}-X%{rs}\n");
-	cfprintf(cout, "      Filter out files with non-%{ex}xargs%{rs}-safe names\n");
-	cfprintf(cout, "  %{cyn}-x%{rs}\n");
-	cfprintf(cout, "      Don't descend into other mount points (same as %{blu}-xdev%{rs})\n\n");
-
-	cfprintf(cout, "  %{cyn}-f%{rs} %{mag}PATH%{rs}\n");
-	cfprintf(cout, "      Treat %{mag}PATH%{rs} as a path to search (useful if begins with a dash)\n\n");
-
-	cfprintf(cout, "  %{blu}-Bmin%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "  %{blu}-Btime%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files Birthed %{bld}N%{rs} minutes/days ago\n");
-	cfprintf(cout, "  %{blu}-Bnewer%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      Find files Birthed more recently than %{bld}FILE%{rs} was modified\n");
-	cfprintf(cout, "  %{blu}-depth%{rs} %{bld}[-+]N%{rs}\n");
-	cfprintf(cout, "      Find files with depth %{bld}N%{rs}\n");
-	cfprintf(cout, "  %{blu}-gid%{rs} %{bld}NAME%{rs}\n");
-	cfprintf(cout, "  %{blu}-uid%{rs} %{bld}NAME%{rs}\n");
-	cfprintf(cout, "      Group/user names are supported in addition to numeric IDs\n");
-	cfprintf(cout, "  %{blu}-size%{rs} %{bld}[-+]N[cwbkMGTP]%{rs}\n");
-	cfprintf(cout, "      Units of %{bld}T%{rs}iB/%{bld}P%{rs}iB are additionally supported\n");
-	cfprintf(cout, "  %{blu}-sparse%{rs}\n");
-	cfprintf(cout, "      Find files that occupy fewer disk blocks than expected\n\n");
-
-	cfprintf(cout, "  %{blu}-exit%{rs} %{bld}[STATUS]%{rs}\n");
-	cfprintf(cout, "      Exit immediately with the given status (%d if unspecified)\n", EXIT_SUCCESS);
-	cfprintf(cout, "  %{blu}-printx%{rs}\n");
-	cfprintf(cout, "      Like %{blu}-print%{rs}, but escape whitespace and quotation characters, to make the\n");
-	cfprintf(cout, "      output safe for %{ex}xargs%{rs}.  Consider using %{blu}-print0%{rs} and %{ex}xargs%{rs} %{bld}-0%{rs} instead.\n");
-	cfprintf(cout, "  %{blu}-rm%{rs}\n");
-	cfprintf(cout, "      Delete any found files (same as %{blu}-delete%{rs}; implies %{blu}-depth%{rs})\n\n");
-
-	cfprintf(cout, "%{ex}bfs%{rs}%{bld}-specific features:%{rs}\n\n");
-
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}0%{rs}\n");
-	cfprintf(cout, "      Disable all optimizations\n");
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}1%{rs}\n");
-	cfprintf(cout, "      Basic logical simplification\n");
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}2%{rs}\n");
-	cfprintf(cout, "      All %{cyn}-O%{rs}%{bld}1%{rs} optimizations, plus dead code elimination and data flow analysis\n");
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}3%{rs} (default)\n");
-	cfprintf(cout, "      All %{cyn}-O%{rs}%{bld}2%{rs} optimizations, plus re-order expressions to reduce expected cost\n");
-	cfprintf(cout, "  %{cyn}-O%{rs}%{bld}4%{rs}/%{cyn}-O%{rs}%{bld}fast%{rs}\n");
-	cfprintf(cout, "      All optimizations, including aggressive optimizations that may alter the\n");
-	cfprintf(cout, "      observed behavior in corner cases\n\n");
-
-	cfprintf(cout, "  %{blu}-color%{rs}\n");
-	cfprintf(cout, "  %{blu}-nocolor%{rs}\n");
-	cfprintf(cout, "      Turn colors on or off (default: %{blu}-color%{rs} if outputting to a terminal,\n");
-	cfprintf(cout, "      %{blu}-nocolor%{rs} otherwise)\n\n");
-
-	cfprintf(cout, "  %{blu}-hidden%{rs}\n");
-	cfprintf(cout, "  %{blu}-nohidden%{rs}\n");
-	cfprintf(cout, "      Match hidden files, or filter them out\n\n");
-
-	cfprintf(cout, "  %{blu}-printf%{rs} %{bld}FORMAT%{rs}\n");
-	cfprintf(cout, "  %{blu}-fprintf%{rs} %{bld}FORMAT%{rs} %{bld}FILE%{rs}\n");
-	cfprintf(cout, "      The additional format directives %%w and %%W%{bld}k%{rs} for printing file birth times\n");
-	cfprintf(cout, "      are supported.\n\n");
-
 	cfprintf(cout, "%s\n", BFS_HOMEPAGE);
+
+	if (pager > 0) {
+		cfclose(cout);
+		waitpid(pager, NULL, 0);
+	}
 
 	state->just_info = true;
 	return NULL;
@@ -2464,7 +2883,7 @@ static struct expr *parse_help(struct parser_state *state, int arg1, int arg2) {
  * "Parse" -version.
  */
 static struct expr *parse_version(struct parser_state *state, int arg1, int arg2) {
-	cfprintf(state->cmdline->cout, "%{ex}bfs%{rs} %{bld}%s%{rs}\n\n", BFS_VERSION);
+	cfprintf(state->cmdline->cout, "${ex}bfs${rs} ${bld}%s${rs}\n\n", BFS_VERSION);
 
 	printf("%s\n", BFS_HOMEPAGE);
 
@@ -2479,117 +2898,129 @@ typedef struct expr *parse_fn(struct parser_state *state, int arg1, int arg2);
  */
 struct table_entry {
 	char *arg;
-	bool prefix;
+	enum token_type type;
 	parse_fn *parse;
 	int arg1;
 	int arg2;
+	bool prefix;
 };
 
 /**
  * The parse table for literals.
  */
 static const struct table_entry parse_table[] = {
-	{"-Bmin", false, parse_time, BFS_STAT_BTIME, MINUTES},
-	{"-Bnewer", false, parse_newer, BFS_STAT_BTIME},
-	{"-Btime", false, parse_time, BFS_STAT_BTIME, DAYS},
-	{"-D", false, parse_debug},
-	{"-E", false, parse_regex_extended},
-	{"-O", true, parse_optlevel},
-	{"-P", false, parse_follow, 0, false},
-	{"-H", false, parse_follow, BFTW_COMFOLLOW, false},
-	{"-L", false, parse_follow, BFTW_LOGICAL | BFTW_DETECT_CYCLES, false},
-	{"-X", false, parse_xargs_safe},
-	{"-a"},
-	{"-amin", false, parse_time, BFS_STAT_ATIME, MINUTES},
-	{"-and"},
-	{"-anewer", false, parse_newer, BFS_STAT_ATIME},
-	{"-atime", false, parse_time, BFS_STAT_ATIME, DAYS},
-	{"-cmin", false, parse_time, BFS_STAT_CTIME, MINUTES},
-	{"-cnewer", false, parse_newer, BFS_STAT_CTIME},
-	{"-ctime", false, parse_time, BFS_STAT_CTIME, DAYS},
-	{"-color", false, parse_color, true},
-	{"-d", false, parse_depth},
-	{"-daystart", false, parse_daystart},
-	{"-delete", false, parse_delete},
-	{"-depth", false, parse_depth_n},
-	{"-empty", false, parse_empty},
-	{"-exec", false, parse_exec, 0},
-	{"-execdir", false, parse_exec, BFS_EXEC_CHDIR},
-	{"-executable", false, parse_access, X_OK},
-	{"-exit", false, parse_exit},
-	{"-f", false, parse_f},
-	{"-false", false, parse_const, false},
-	{"-fls", false, parse_fls},
-	{"-follow", false, parse_follow, BFTW_LOGICAL | BFTW_DETECT_CYCLES, true},
-	{"-fprint", false, parse_fprint},
-	{"-fprint0", false, parse_fprint0},
-	{"-fprintf", false, parse_fprintf},
-	{"-fstype", false, parse_fstype},
-	{"-gid", false, parse_group},
-	{"-group", false, parse_group},
-	{"-help", false, parse_help},
-	{"-hidden", false, parse_hidden},
-	{"-ignore_readdir_race", false, parse_ignore_races, true},
-	{"-ilname", false, parse_lname, true},
-	{"-iname", false, parse_name, true},
-	{"-inum", false, parse_inum},
-	{"-ipath", false, parse_path, true},
-	{"-iregex", false, parse_regex, REG_ICASE},
-	{"-iwholename", false, parse_path, true},
-	{"-links", false, parse_links},
-	{"-lname", false, parse_lname, false},
-	{"-ls", false, parse_ls},
-	{"-maxdepth", false, parse_depth_limit, false},
-	{"-mindepth", false, parse_depth_limit, true},
-	{"-mmin", false, parse_time, BFS_STAT_MTIME, MINUTES},
-	{"-mnewer", false, parse_newer, BFS_STAT_MTIME},
-	{"-mount", false, parse_mount},
-	{"-mtime", false, parse_time, BFS_STAT_MTIME, DAYS},
-	{"-name", false, parse_name, false},
-	{"-newer", false, parse_newer, BFS_STAT_MTIME},
-	{"-newer", true, parse_newerxy},
-	{"-nocolor", false, parse_color, false},
-	{"-nogroup", false, parse_nogroup},
-	{"-nohidden", false, parse_nohidden},
-	{"-noignore_readdir_race", false, parse_ignore_races, false},
-	{"-noleaf", false, parse_noleaf},
-	{"-not"},
-	{"-nouser", false, parse_nouser},
-	{"-nowarn", false, parse_warn, false},
-	{"-o"},
-	{"-ok", false, parse_exec, BFS_EXEC_CONFIRM},
-	{"-okdir", false, parse_exec, BFS_EXEC_CONFIRM | BFS_EXEC_CHDIR},
-	{"-or"},
-	{"-path", false, parse_path, false},
-	{"-perm", false, parse_perm},
-	{"-print", false, parse_print},
-	{"-print0", false, parse_print0},
-	{"-printf", false, parse_printf},
-	{"-printx", false, parse_printx},
-	{"-prune", false, parse_prune},
-	{"-quit", false, parse_quit},
-	{"-readable", false, parse_access, R_OK},
-	{"-regex", false, parse_regex, 0},
-	{"-regextype", false, parse_regextype},
-	{"-rm", false, parse_delete},
-	{"-samefile", false, parse_samefile},
-	{"-size", false, parse_size},
-	{"-sparse", false, parse_sparse},
-	{"-true", false, parse_const, true},
-	{"-type", false, parse_type, false},
-	{"-uid", false, parse_user},
-	{"-used", false, parse_used},
-	{"-user", false, parse_user},
-	{"-version", false, parse_version},
-	{"-warn", false, parse_warn, true},
-	{"-wholename", false, parse_path, false},
-	{"-writable", false, parse_access, W_OK},
-	{"-x", false, parse_mount},
-	{"-xdev", false, parse_mount},
-	{"-xtype", false, parse_type, true},
-	{"--"},
-	{"--help", false, parse_help},
-	{"--version", false, parse_version},
+	{"--", T_FLAG},
+	{"--help", T_ACTION, parse_help},
+	{"--version", T_ACTION, parse_version},
+	{"-Bmin", T_TEST, parse_time, BFS_STAT_BTIME, MINUTES},
+	{"-Bnewer", T_TEST, parse_newer, BFS_STAT_BTIME},
+	{"-Bsince", T_TEST, parse_since, BFS_STAT_BTIME},
+	{"-Btime", T_TEST, parse_time, BFS_STAT_BTIME, DAYS},
+	{"-D", T_FLAG, parse_debug},
+	{"-E", T_FLAG, parse_regex_extended},
+	{"-H", T_FLAG, parse_follow, BFTW_COMFOLLOW, false},
+	{"-L", T_FLAG, parse_follow, BFTW_LOGICAL, false},
+	{"-O", T_FLAG, parse_optlevel, 0, 0, true},
+	{"-P", T_FLAG, parse_follow, 0, false},
+	{"-S", T_FLAG, parse_search_strategy},
+	{"-X", T_FLAG, parse_xargs_safe},
+	{"-a", T_OPERATOR},
+	{"-acl", T_TEST, parse_acl},
+	{"-amin", T_TEST, parse_time, BFS_STAT_ATIME, MINUTES},
+	{"-and", T_OPERATOR},
+	{"-anewer", T_TEST, parse_newer, BFS_STAT_ATIME},
+	{"-asince", T_TEST, parse_since, BFS_STAT_ATIME},
+	{"-atime", T_TEST, parse_time, BFS_STAT_ATIME, DAYS},
+	{"-capable", T_TEST, parse_capable},
+	{"-cmin", T_TEST, parse_time, BFS_STAT_CTIME, MINUTES},
+	{"-cnewer", T_TEST, parse_newer, BFS_STAT_CTIME},
+	{"-color", T_OPTION, parse_color, true},
+	{"-csince", T_TEST, parse_since, BFS_STAT_CTIME},
+	{"-ctime", T_TEST, parse_time, BFS_STAT_CTIME, DAYS},
+	{"-d", T_FLAG, parse_depth},
+	{"-daystart", T_OPTION, parse_daystart},
+	{"-delete", T_ACTION, parse_delete},
+	{"-depth", T_OPTION, parse_depth_n},
+	{"-empty", T_TEST, parse_empty},
+	{"-exec", T_ACTION, parse_exec, 0},
+	{"-execdir", T_ACTION, parse_exec, BFS_EXEC_CHDIR},
+	{"-executable", T_TEST, parse_access, X_OK},
+	{"-exit", T_ACTION, parse_exit},
+	{"-f", T_FLAG, parse_f},
+	{"-false", T_TEST, parse_const, false},
+	{"-fls", T_ACTION, parse_fls},
+	{"-follow", T_OPTION, parse_follow, BFTW_LOGICAL, true},
+	{"-fprint", T_ACTION, parse_fprint},
+	{"-fprint0", T_ACTION, parse_fprint0},
+	{"-fprintf", T_ACTION, parse_fprintf},
+	{"-fstype", T_TEST, parse_fstype},
+	{"-gid", T_TEST, parse_group},
+	{"-group", T_TEST, parse_group},
+	{"-help", T_ACTION, parse_help},
+	{"-hidden", T_TEST, parse_hidden},
+	{"-ignore_readdir_race", T_OPTION, parse_ignore_races, true},
+	{"-ilname", T_TEST, parse_lname, true},
+	{"-iname", T_TEST, parse_name, true},
+	{"-inum", T_TEST, parse_inum},
+	{"-ipath", T_TEST, parse_path, true},
+	{"-iregex", T_TEST, parse_regex, REG_ICASE},
+	{"-iwholename", T_TEST, parse_path, true},
+	{"-links", T_TEST, parse_links},
+	{"-lname", T_TEST, parse_lname, false},
+	{"-ls", T_ACTION, parse_ls},
+	{"-maxdepth", T_OPTION, parse_depth_limit, false},
+	{"-mindepth", T_OPTION, parse_depth_limit, true},
+	{"-mmin", T_TEST, parse_time, BFS_STAT_MTIME, MINUTES},
+	{"-mnewer", T_TEST, parse_newer, BFS_STAT_MTIME},
+	{"-mount", T_OPTION, parse_mount},
+	{"-msince", T_TEST, parse_since, BFS_STAT_MTIME},
+	{"-mtime", T_TEST, parse_time, BFS_STAT_MTIME, DAYS},
+	{"-name", T_TEST, parse_name, false},
+	{"-newer", T_TEST, parse_newer, BFS_STAT_MTIME},
+	{"-newer", T_TEST, parse_newerxy, 0, 0, true},
+	{"-nocolor", T_OPTION, parse_color, false},
+	{"-nogroup", T_TEST, parse_nogroup},
+	{"-nohidden", T_TEST, parse_nohidden},
+	{"-noignore_readdir_race", T_OPTION, parse_ignore_races, false},
+	{"-noleaf", T_OPTION, parse_noleaf},
+	{"-not", T_OPERATOR},
+	{"-nouser", T_TEST, parse_nouser},
+	{"-nowarn", T_TEST, parse_warn, false},
+	{"-o", T_OPERATOR},
+	{"-ok", T_ACTION, parse_exec, BFS_EXEC_CONFIRM},
+	{"-okdir", T_ACTION, parse_exec, BFS_EXEC_CONFIRM | BFS_EXEC_CHDIR},
+	{"-or", T_OPERATOR},
+	{"-path", T_TEST, parse_path, false},
+	{"-perm", T_TEST, parse_perm},
+	{"-print", T_ACTION, parse_print},
+	{"-print0", T_ACTION, parse_print0},
+	{"-printf", T_ACTION, parse_printf},
+	{"-printx", T_ACTION, parse_printx},
+	{"-prune", T_ACTION, parse_prune},
+	{"-quit", T_ACTION, parse_quit},
+	{"-readable", T_TEST, parse_access, R_OK},
+	{"-regex", T_TEST, parse_regex, 0},
+	{"-regextype", T_OPTION, parse_regextype},
+	{"-rm", T_ACTION, parse_delete},
+	{"-s", T_FLAG, parse_s},
+	{"-samefile", T_TEST, parse_samefile},
+	{"-since", T_TEST, parse_since, BFS_STAT_MTIME},
+	{"-size", T_TEST, parse_size},
+	{"-sparse", T_TEST, parse_sparse},
+	{"-true", T_TEST, parse_const, true},
+	{"-type", T_TEST, parse_type, false},
+	{"-uid", T_TEST, parse_user},
+	{"-unique", T_ACTION, parse_unique},
+	{"-used", T_TEST, parse_used},
+	{"-user", T_TEST, parse_user},
+	{"-version", T_ACTION, parse_version},
+	{"-warn", T_OPTION, parse_warn, true},
+	{"-wholename", T_TEST, parse_path, false},
+	{"-writable", T_TEST, parse_access, W_OK},
+	{"-x", T_FLAG, parse_xdev},
+	{"-xattr", T_TEST, parse_xattr},
+	{"-xdev", T_OPTION, parse_xdev},
+	{"-xtype", T_TEST, parse_type, true},
 	{0},
 };
 
@@ -2632,8 +3063,6 @@ static const struct table_entry *table_lookup_fuzzy(const char *arg) {
  *         | ACTION
  */
 static struct expr *parse_literal(struct parser_state *state) {
-	struct cmdline *cmdline = state->cmdline;
-
 	// Paths are already skipped at this point
 	const char *arg = state->argv[0];
 
@@ -2652,9 +3081,19 @@ static struct expr *parse_literal(struct parser_state *state) {
 
 	match = table_lookup_fuzzy(arg);
 
-	cfprintf(cmdline->cerr,
-	         "%{er}error: Unknown argument '%s'; did you mean '%s'?%{rs}",
-	         arg, match->arg);
+	CFILE *cerr = state->cmdline->cerr;
+	parse_error(state, "Unknown argument ${er}%s${rs}; did you mean ", arg);
+	switch (match->type) {
+	case T_FLAG:
+		cfprintf(cerr, "${cyn}%s${rs}?", match->arg);
+		break;
+	case T_OPERATOR:
+		cfprintf(cerr, "${red}%s${rs}?", match->arg);
+		break;
+	default:
+		cfprintf(cerr, "${blu}%s${rs}?", match->arg);
+		break;
+	}
 
 	if (!state->interactive || !match->parse) {
 		fprintf(stderr, "\n");
@@ -2676,7 +3115,7 @@ unmatched:
 	return NULL;
 
 unexpected:
-	cfprintf(cmdline->cerr, "%{er}error: Expected a predicate; found '%s'.%{rs}\n", arg);
+	parse_error(state, "Expected a predicate; found ${er}%s${rs}.\n", arg);
 	return NULL;
 }
 
@@ -2686,15 +3125,13 @@ unexpected:
  *        | LITERAL
  */
 static struct expr *parse_factor(struct parser_state *state) {
-	CFILE *cerr = state->cmdline->cerr;
-
 	if (skip_paths(state) != 0) {
 		return NULL;
 	}
 
 	const char *arg = state->argv[0];
 	if (!arg) {
-		cfprintf(cerr, "%{er}error: Expression terminated prematurely after '%s'.%{rs}\n", state->argv[-1]);
+		parse_error(state, "Expression terminated prematurely after ${red}%s${rs}.\n", state->last_arg);
 		return NULL;
 	}
 
@@ -2713,7 +3150,7 @@ static struct expr *parse_factor(struct parser_state *state) {
 
 		arg = state->argv[0];
 		if (!arg || strcmp(arg, ")") != 0) {
-			cfprintf(cerr, "%{er}error: Expected a ')' after '%s'.%{rs}\n", state->argv[-1]);
+			parse_error(state, "Expected a ${red})${rs} after ${blu}%s${rs}.\n", state->argv[-1]);
 			free_expr(expr);
 			return NULL;
 		}
@@ -2861,8 +3298,6 @@ static struct expr *parse_whole_expr(struct parser_state *state) {
 		return NULL;
 	}
 
-	CFILE *cerr = state->cmdline->cerr;
-
 	struct expr *expr = &expr_true;
 	if (state->argv[0]) {
 		expr = parse_expr(state);
@@ -2872,7 +3307,7 @@ static struct expr *parse_whole_expr(struct parser_state *state) {
 	}
 
 	if (state->argv[0]) {
-		cfprintf(cerr, "%{er}error: Unexpected argument '%s'.%{rs}\n", state->argv[0]);
+		parse_error(state, "Unexpected argument ${er}%s${rs}.\n", state->argv[0]);
 		goto fail;
 	}
 
@@ -2889,11 +3324,15 @@ static struct expr *parse_whole_expr(struct parser_state *state) {
 		}
 	}
 
-	if (state->warn && state->depth_arg && state->prune_arg) {
-		cfprintf(cerr, "%{wr}warning: %s does not work in the presence of %s.%{rs}\n", state->prune_arg, state->depth_arg);
+	if (state->mount_arg && state->xdev_arg) {
+		parse_warning(state, "${blu}%s${rs} is redundant in the presence of ${blu}%s${rs}.\n\n", state->xdev_arg, state->mount_arg);
+	}
+
+	if (state->cmdline->warn && state->depth_arg && state->prune_arg) {
+		parse_warning(state, "${blu}%s${rs} does not work in the presence of ${blu}%s${rs}.\n", state->prune_arg, state->depth_arg);
 
 		if (state->interactive) {
-			cfprintf(cerr, "%{wr}Do you want to continue?%{rs} ");
+			fprintf(stderr, "Do you want to continue? ");
 			if (ynprompt() == 0) {
 				goto fail;
 			}
@@ -2915,64 +3354,94 @@ fail:
 void dump_cmdline(const struct cmdline *cmdline, bool verbose) {
 	CFILE *cerr = cmdline->cerr;
 
+	cfprintf(cerr, "${ex}%s${rs} ", cmdline->argv[0]);
+
 	if (cmdline->flags & BFTW_LOGICAL) {
-		cfprintf(cerr, "%{cyn}-L%{rs} ");
+		cfprintf(cerr, "${cyn}-L${rs} ");
 	} else if (cmdline->flags & BFTW_COMFOLLOW) {
-		cfprintf(cerr, "%{cyn}-H%{rs} ");
+		cfprintf(cerr, "${cyn}-H${rs} ");
 	} else {
-		cfprintf(cerr, "%{cyn}-P%{rs} ");
+		cfprintf(cerr, "${cyn}-P${rs} ");
+	}
+
+	if (cmdline->xargs_safe) {
+		cfprintf(cerr, "${cyn}-X${rs} ");
+	}
+
+	if (cmdline->flags & BFTW_SORT) {
+		cfprintf(cerr, "${cyn}-s${rs} ");
 	}
 
 	if (cmdline->optlevel != 3) {
-		cfprintf(cerr, "%{cyn}-O%d%{rs} ", cmdline->optlevel);
+		cfprintf(cerr, "${cyn}-O%d${rs} ", cmdline->optlevel);
 	}
 
-	if (cmdline->debug & DEBUG_COST) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}cost%{rs} ");
+	const char *strategy = NULL;
+	switch (cmdline->strategy) {
+	case BFTW_BFS:
+		strategy = "bfs";
+		break;
+	case BFTW_DFS:
+		strategy = "dfs";
+		break;
+	case BFTW_IDS:
+		strategy = "ids";
+		break;
 	}
-	if (cmdline->debug & DEBUG_EXEC) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}exec%{rs} ");
-	}
-	if (cmdline->debug & DEBUG_OPT) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}opt%{rs} ");
-	}
-	if (cmdline->debug & DEBUG_RATES) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}rates%{rs} ");
-	}
-	if (cmdline->debug & DEBUG_STAT) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}stat%{rs} ");
-	}
-	if (cmdline->debug & DEBUG_TREE) {
-		cfprintf(cerr, "%{cyn}-D%{rs} %{bld}tree%{rs} ");
-	}
+	assert(strategy);
+	cfprintf(cerr, "${cyn}-S${rs} ${bld}%s${rs} ", strategy);
 
-	for (struct root *root = cmdline->roots; root; root = root->next) {
-		char c = root->path[0];
-		if (c == '-' || c == '(' || c == ')' || c == '!' || c == ',') {
-			cfprintf(cerr, "%{cyn}-f%{rs} ");
+	enum debug_flags debug = cmdline->debug;
+	if (debug) {
+		cfprintf(cerr, "${cyn}-D${rs} ");
+		for (int i = 0; debug; ++i) {
+			enum debug_flags flag = debug_flags[i].flag;
+			const char *name = debug_flags[i].name;
+			if ((debug & flag) == flag) {
+				cfprintf(cerr, "${bld}%s${rs}", name);
+				debug ^= flag;
+				if (debug) {
+					cfprintf(cerr, ",");
+				}
+			}
 		}
-		cfprintf(cerr, "%{mag}%s%{rs} ", root->path);
+		cfprintf(cerr, " ");
+	}
+
+	for (size_t i = 0; i < darray_length(cmdline->paths); ++i) {
+		const char *path = cmdline->paths[i];
+		char c = path[0];
+		if (c == '-' || c == '(' || c == ')' || c == '!' || c == ',') {
+			cfprintf(cerr, "${cyn}-f${rs} ");
+		}
+		cfprintf(cerr, "${mag}%s${rs} ", path);
 	}
 
 	if (cmdline->cout->colors) {
-		cfprintf(cerr, "%{blu}-color%{rs} ");
+		cfprintf(cerr, "${blu}-color${rs} ");
 	} else {
-		cfprintf(cerr, "%{blu}-nocolor%{rs} ");
+		cfprintf(cerr, "${blu}-nocolor${rs} ");
 	}
 	if (cmdline->flags & BFTW_DEPTH) {
-		cfprintf(cerr, "%{blu}-depth%{rs} ");
+		cfprintf(cerr, "${blu}-depth${rs} ");
 	}
 	if (cmdline->ignore_races) {
-		cfprintf(cerr, "%{blu}-ignore_readdir_race%{rs} ");
-	}
-	if (cmdline->flags & BFTW_XDEV) {
-		cfprintf(cerr, "%{blu}-mount%{rs} ");
+		cfprintf(cerr, "${blu}-ignore_readdir_race${rs} ");
 	}
 	if (cmdline->mindepth != 0) {
-		cfprintf(cerr, "%{blu}-mindepth%{rs} %{bld}%d%{rs} ", cmdline->mindepth);
+		cfprintf(cerr, "${blu}-mindepth${rs} ${bld}%d${rs} ", cmdline->mindepth);
 	}
 	if (cmdline->maxdepth != INT_MAX) {
-		cfprintf(cerr, "%{blu}-maxdepth%{rs} %{bld}%d%{rs} ", cmdline->maxdepth);
+		cfprintf(cerr, "${blu}-maxdepth${rs} ${bld}%d${rs} ", cmdline->maxdepth);
+	}
+	if (cmdline->flags & BFTW_MOUNT) {
+		cfprintf(cerr, "${blu}-mount${rs} ");
+	}
+	if (cmdline->unique) {
+		cfprintf(cerr, "${blu}-unique${rs} ");
+	}
+	if ((cmdline->flags & (BFTW_MOUNT | BFTW_XDEV)) == BFTW_XDEV) {
+		cfprintf(cerr, "${blu}-xdev${rs} ");
 	}
 
 	dump_expr(cerr, cmdline->expr, verbose);
@@ -2986,8 +3455,8 @@ void dump_cmdline(const struct cmdline *cmdline, bool verbose) {
 static void dump_costs(const struct cmdline *cmdline) {
 	CFILE *cerr = cmdline->cerr;
 	const struct expr *expr = cmdline->expr;
-	cfprintf(cerr, "       Cost: ~%{ylw}%g%{rs}\n", expr->cost);
-	cfprintf(cerr, "Probability: ~%{ylw}%g%%%{rs}\n", 100.0*expr->probability);
+	cfprintf(cerr, "       Cost: ~${ylw}%g${rs}\n", expr->cost);
+	cfprintf(cerr, "Probability: ~${ylw}%g%%${rs}\n", 100.0*expr->probability);
 }
 
 /**
@@ -3024,21 +3493,36 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 	}
 
 	cmdline->argv = NULL;
-	cmdline->roots = NULL;
+	cmdline->paths = NULL;
 	cmdline->colors = NULL;
 	cmdline->cout = NULL;
 	cmdline->cerr = NULL;
+	cmdline->users = NULL;
+	cmdline->users_error = 0;
+	cmdline->groups = NULL;
+	cmdline->groups_error = 0;
 	cmdline->mtab = NULL;
+	cmdline->mtab_error = 0;
 	cmdline->mindepth = 0;
 	cmdline->maxdepth = INT_MAX;
 	cmdline->flags = BFTW_RECOVER;
+	cmdline->strategy = BFTW_BFS;
 	cmdline->optlevel = 3;
 	cmdline->debug = 0;
-	cmdline->xargs_safe = false;
 	cmdline->ignore_races = false;
+	cmdline->unique = false;
+	cmdline->warn = false;
+	cmdline->xargs_safe = false;
 	cmdline->expr = &expr_true;
-	cmdline->open_files = NULL;
 	cmdline->nopen_files = 0;
+
+	trie_init(&cmdline->open_files);
+
+	static char* default_argv[] = {"bfs", NULL};
+	if (argc < 1) {
+		argc = 1;
+		argv = default_argv;
+	}
 
 	cmdline->argv = malloc((argc + 1)*sizeof(*cmdline->argv));
 	if (!cmdline->argv) {
@@ -3049,32 +3533,65 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 		cmdline->argv[i] = argv[i];
 	}
 
+	enum use_color use_color = COLOR_AUTO;
+	if (getenv("NO_COLOR")) {
+		// https://no-color.org/
+		use_color = COLOR_NEVER;
+	}
+
 	cmdline->colors = parse_colors(getenv("LS_COLORS"));
-	cmdline->cout = cfdup(stdout, cmdline->colors);
-	cmdline->cerr = cfdup(stderr, cmdline->colors);
+	cmdline->cout = cfdup(stdout, use_color ? cmdline->colors : NULL);
+	cmdline->cerr = cfdup(stderr, use_color ? cmdline->colors : NULL);
 	if (!cmdline->cout || !cmdline->cerr) {
 		perror("cfdup()");
 		goto fail;
 	}
 
-	bool stderr_tty = cmdline->cerr->colors;
+	cmdline->users = bfs_parse_users();
+	if (!cmdline->users) {
+		cmdline->users_error = errno;
+	}
+
+	cmdline->groups = bfs_parse_groups();
+	if (!cmdline->groups) {
+		cmdline->groups_error = errno;
+	}
+
+	cmdline->mtab = parse_bfs_mtab();
+	if (!cmdline->mtab) {
+		cmdline->mtab_error = errno;
+	}
+
 	bool stdin_tty = isatty(STDIN_FILENO);
+	bool stdout_tty = isatty(STDOUT_FILENO);
+	bool stderr_tty = isatty(STDERR_FILENO);
+
+	if (!getenv("POSIXLY_CORRECT")) {
+		cmdline->warn = stdin_tty;
+	}
 
 	struct parser_state state = {
 		.cmdline = cmdline,
 		.argv = cmdline->argv + 1,
 		.command = cmdline->argv[0],
-		.roots_tail = &cmdline->roots,
 		.regex_flags = 0,
-		.interactive = stderr_tty && stdin_tty,
-		.use_color = COLOR_AUTO,
+		.stdout_tty = stdout_tty,
+		.interactive = stdin_tty && stderr_tty,
+		.use_color = use_color,
 		.implicit_print = true,
-		.warn = stdin_tty,
 		.non_option_seen = false,
 		.just_info = false,
+		.last_arg = NULL,
 		.depth_arg = NULL,
 		.prune_arg = NULL,
+		.mount_arg = NULL,
+		.xdev_arg = NULL,
 	};
+
+	if (strcmp(xbasename(state.command), "find") == 0) {
+		// Operate depth-first when invoked as "find"
+		cmdline->strategy = BFTW_DFS;
+	}
 
 	if (parse_gettime(&state.now) != 0) {
 		goto fail;
@@ -3093,10 +3610,15 @@ struct cmdline *parse_cmdline(int argc, char *argv[]) {
 		goto fail;
 	}
 
-	if (!cmdline->roots) {
+	if (darray_length(cmdline->paths) == 0) {
 		if (parse_root(&state, ".") != 0) {
 			goto fail;
 		}
+	}
+
+	if ((cmdline->flags & BFTW_LOGICAL) && !cmdline->unique) {
+		// We need bftw() to detect cycles unless -unique does it for us
+		cmdline->flags |= BFTW_DETECT_CYCLES;
 	}
 
 	if (cmdline->debug & DEBUG_TREE) {

@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2016-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2016-2020 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,38 +14,81 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * Assorted utilities that don't belong anywhere else.
+ */
+
 #ifndef BFS_UTIL_H
 #define BFS_UTIL_H
 
-#include "bftw.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <regex.h>
 #include <stdbool.h>
 #include <sys/types.h>
-#include <time.h>
 
 // Some portability concerns
+
+#ifdef __has_feature
+#	define BFS_HAS_FEATURE(feature, fallback) __has_feature(feature)
+#else
+#	define BFS_HAS_FEATURE(feature, fallback) fallback
+#endif
+
+#ifdef __has_include
+#	define BFS_HAS_INCLUDE(header, fallback) __has_include(header)
+#else
+#	define BFS_HAS_INCLUDE(header, fallback) fallback
+#endif
+
+#ifndef BFS_HAS_MNTENT
+#	define BFS_HAS_MNTENT BFS_HAS_INCLUDE(<mntent.h>, __GLIBC__)
+#endif
+
+#ifndef BFS_HAS_SYS_ACL
+#	define BFS_HAS_SYS_ACL BFS_HAS_INCLUDE(<sys/acl.h>, true)
+#endif
+
+#ifndef BFS_HAS_SYS_CAPABILITY
+#	define BFS_HAS_SYS_CAPABILITY BFS_HAS_INCLUDE(<sys/capability.h>, __linux__)
+#endif
+
+#ifndef BFS_HAS_SYS_EXTATTR
+#	define BFS_HAS_SYS_EXTATTR BFS_HAS_INCLUDE(<sys/extattr.h>, __FreeBSD__)
+#endif
+
+#ifndef BFS_HAS_SYS_MKDEV
+#	define BFS_HAS_SYS_MKDEV BFS_HAS_INCLUDE(<sys/mkdev.h>, false)
+#endif
+
+#ifndef BFS_HAS_SYS_PARAM
+#	define BFS_HAS_SYS_PARAM BFS_HAS_INCLUDE(<sys/param.h>, true)
+#endif
+
+#ifndef BFS_HAS_SYS_SYSMACROS
+#	define BFS_HAS_SYS_SYSMACROS BFS_HAS_INCLUDE(<sys/sysmacros.h>, __GLIBC__)
+#endif
+
+#ifndef BFS_HAS_SYS_XATTR
+#	define BFS_HAS_SYS_XATTR BFS_HAS_INCLUDE(<sys/xattr.h>, __linux__)
+#endif
 
 #if !defined(FNM_CASEFOLD) && defined(FNM_IGNORECASE)
 #	define FNM_CASEFOLD FNM_IGNORECASE
 #endif
 
-#ifndef S_ISDOOR
-#	define S_ISDOOR(mode) false
-#endif
-
-#ifndef S_ISPORT
-#	define S_ISPORT(mode) false
-#endif
-
-#ifndef S_ISWHT
-#	define S_ISWHT(mode) false
-#endif
-
 #ifndef O_DIRECTORY
 #	define O_DIRECTORY 0
+#endif
+
+/**
+ * Adds compiler warnings for bad printf()-style function calls, if supported.
+ */
+#if __GNUC__
+#	define BFS_FORMATTER(fmt, args) __attribute__((format(printf, fmt, args)))
+#else
+#	define BFS_FORMATTER(fmt, args)
 #endif
 
 /**
@@ -116,17 +159,6 @@ int pipe_cloexec(int pipefd[2]);
 char *xregerror(int err, const regex_t *regex);
 
 /**
- * localtime_r() wrapper that calls tzset() first.
- *
- * @param timep
- *         The time_t to convert.
- * @param result
- *         Buffer to hold the result.
- * @return 0 on success, -1 on failure.
- */
-int xlocaltime(const time_t *timep, struct tm *result);
-
-/**
  * Format a mode like ls -l (e.g. -rw-r--r--).
  *
  * @param mode
@@ -156,20 +188,25 @@ int xfaccessat(int fd, const char *path, int amode);
 bool is_nonexistence_error(int error);
 
 /**
- * Convert a bfs_stat() mode to a bftw() typeflag.
- */
-enum bftw_typeflag mode_to_typeflag(mode_t mode);
-
-/**
- * Convert a directory entry to a bftw() typeflag.
- */
-enum bftw_typeflag dirent_to_typeflag(const struct dirent *de);
-
-/**
  * Process a yes/no prompt.
  *
  * @return 1 for yes, 0 for no, and -1 for unknown.
  */
 int ynprompt(void);
+
+/**
+ * Portable version of makedev().
+ */
+dev_t bfs_makedev(int ma, int mi);
+
+/**
+ * Portable version of major().
+ */
+int bfs_major(dev_t dev);
+
+/**
+ * Portable version of minor().
+ */
+int bfs_minor(dev_t dev);
 
 #endif // BFS_UTIL_H

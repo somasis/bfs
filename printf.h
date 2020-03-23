@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2017 Tavian Barnes <tavianator@tavianator.com>             *
+ * Copyright (C) 2017-2019 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,26 +14,22 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * Implementation of -printf/-fprintf.
+ */
+
 #ifndef BFS_PRINTF_H
 #define BFS_PRINTF_H
 
 #include "bftw.h"
-#include "color.h"
+#include "cmdline.h"
 #include <stdbool.h>
 #include <stdio.h>
-
-struct cmdline;
-struct bfs_printf_directive;
 
 /**
  * A printf command, the result of parsing a single format string.
  */
-struct bfs_printf {
-	/** The chain of printf directives. */
-	struct bfs_printf_directive *directives;
-	/** Whether the struct bfs_stat must be filled in. */
-	bool needs_stat;
-};
+struct bfs_printf;
 
 /**
  * Parse a -printf format string.

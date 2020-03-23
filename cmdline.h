@@ -1,6 +1,6 @@
 /****************************************************************************
  * bfs                                                                      *
- * Copyright (C) 2015-2017 Tavian Barnes <tavianator@tavianator.com>        *
+ * Copyright (C) 2015-2018 Tavian Barnes <tavianator@tavianator.com>        *
  *                                                                          *
  * Permission to use, copy, modify, and/or distribute this software for any *
  * purpose with or without fee is hereby granted.                           *
@@ -14,10 +14,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.           *
  ****************************************************************************/
 
+/**
+ * Representation of the parsed command line.
+ */
+
 #ifndef BFS_CMDLINE_H
 #define BFS_CMDLINE_H
 
 #include "color.h"
+#include "trie.h"
 
 /**
  * Various debugging flags.
@@ -37,22 +42,9 @@ enum debug_flags {
 	DEBUG_STAT   = 1 << 5,
 	/** Print the parse tree. */
 	DEBUG_TREE   = 1 << 6,
+	/** All debug flags. */
+	DEBUG_ALL    = (1 << 7) - 1,
 };
-
-/**
- * A root path to explore.
- */
-struct root {
-	/** The root path itself. */
-	const char *path;
-	/** The next path in the list. */
-	struct root *next;
-};
-
-/**
- * An open file for the command line.
- */
-struct open_file;
 
 /**
  * The parsed command line.
@@ -61,8 +53,8 @@ struct cmdline {
 	/** The unparsed command line arguments. */
 	char **argv;
 
-	/** The list of root paths. */
-	struct root *roots;
+	/** The root paths. */
+	const char **paths;
 
 	/** Color data. */
 	struct colors *colors;
@@ -71,8 +63,19 @@ struct cmdline {
 	/** Colored stderr. */
 	CFILE *cerr;
 
+	/** User table. */
+	struct bfs_users *users;
+	/** The error that occurred parsing the user table, if any. */
+	int users_error;
+	/** Group table. */
+	struct bfs_groups *groups;
+	/** The error that occurred parsing the group table, if any. */
+	int groups_error;
+
 	/** Table of mounted file systems. */
 	struct bfs_mtab *mtab;
+	/** The error that occurred parsing the mount table, if any. */
+	int mtab_error;
 
 	/** -mindepth option. */
 	int mindepth;
@@ -81,21 +84,27 @@ struct cmdline {
 
 	/** bftw() flags. */
 	enum bftw_flags flags;
+	/** bftw() search strategy. */
+	enum bftw_strategy strategy;
 
-	/** Optimization level. */
+	/** Optimization level (-O). */
 	int optlevel;
-	/** Debugging flags. */
+	/** Debugging flags (-D). */
 	enum debug_flags debug;
-	/** Whether to only handle paths with xargs-safe characters. */
-	bool xargs_safe;
-	/** Whether to ignore deletions that race with bfs. */
+	/** Whether to ignore deletions that race with bfs (-ignore_readdir_race). */
 	bool ignore_races;
+	/** Whether to only return unique files (-unique). */
+	bool unique;
+	/** Whether to print warnings (-warn/-nowarn). */
+	bool warn;
+	/** Whether to only handle paths with xargs-safe characters (-X). */
+	bool xargs_safe;
 
 	/** The command line expression. */
 	struct expr *expr;
 
 	/** All the open files owned by the command line. */
-	struct open_file *open_files;
+	struct trie open_files;
 	/** The number of open files owned by the command line. */
 	int nopen_files;
 };
