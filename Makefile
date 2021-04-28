@@ -33,6 +33,10 @@ INSTALL ?= install
 MKDIR ?= mkdir -p
 RM ?= rm -f
 
+WANT_ACL ?= true
+WANT_ATTR ?= true
+WANT_CAP ?= true
+
 DEFAULT_CFLAGS ?= -g -Wall -Wmissing-declarations -Wshadow -Wsign-compare -Wstrict-prototypes
 
 CFLAGS ?= $(DEFAULT_CFLAGS)
@@ -63,7 +67,22 @@ UBSAN_CFLAGS := -fsanitize=undefined
 
 ifeq ($(OS),Linux)
 LOCAL_LDFLAGS += -Wl,--as-needed
-LOCAL_LDLIBS += -lacl -lcap -lattr -lrt
+LOCAL_LDLIBS += -lrt
+ifeq ($(WANT_ACL),true)
+LOCAL_LDLIBS += -lacl
+else
+LOCAL_CFLAGS+= -DBFS_HAS_SYS_ACL=0
+endif
+ifeq ($(WANT_CAP),true)
+LOCAL_LDLIBS += -lcap
+else
+LOCAL_CFLAGS+= -DBFS_HAS_SYS_CAPABILITY=0
+endif
+ifeq ($(WANT_ATTR),true)
+LOCAL_LDLIBS += -lattr
+else
+LOCAL_CFLAGS+= -DBFS_HAS_SYS_XATTR=0
+endif
 
 # These libraries are not built with msan, so disable them
 MSAN_CFLAGS += -DBFS_HAS_SYS_ACL=0 -DBFS_HAS_SYS_CAPABILITY=0 -DBFS_HAS_SYS_XATTR=0
